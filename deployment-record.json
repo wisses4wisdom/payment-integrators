@@ -1,0 +1,86 @@
+{
+  "network": "baseSepolia",
+  "note": "v13 (INTERNAL CUSTODY — H-1 fix): PayQRVault REMOVED; the integrator custodies all merchant USDC itself, so funds + per-merchant records live in ONE contract. Solvency invariant usdc.balanceOf(this) >= totalOwed is local; upgrades are drain-in-place (no cross-contract migration; migrateState/setVault/flushToVault deleted). Adds sweepStrandedBuy (recover a COMPLETED BUY whose onOrderComplete callback reverted) + per-orderId onOrderComplete idempotency guard + deploy-time USDC/Diamond binding assert (L-1). 106 tests. Adversarial audit (13 PoCs): no CRITICAL/HIGH/MED. Deployed 2026-07-15. NOT source-verified on Basescan (per request — deployed for live testing).",
+  "usdc": "0x4095fE4f1E636f11A95820BA2bB87F335Bd1040d",
+  "diamond": "0xeb0BB8E3c014D915D9B2df03aBB130a1Fb44beb9",
+  "integrator": "0x2fB634bb54d3a6788ec6bf2eeA3a0D792Db3f23A",
+  "proxyImpl": "0x9B9233691bAAE1d9812c6BAFfa94d58Aca4327D2",
+  "client": "0xf2CBBeFFFcE107D7eA4cf5f8Babc267d02719f97",
+  "deployer": "0x4f45446a6E934Fd03A353eC4DAc7Cd544f03d426",
+  "superAdmin": "0x4f45446a6E934Fd03A353eC4DAc7Cd544f03d426",
+  "runtimeBytecodeKeccak": "0x8a8851e36e3c61654517f3e249d949d2e980137b34bc9747147e8381441e8812",
+  "usdcThroughIntegrator": false,
+  "whitelistRequest": {
+    "integrator": "0x2fB634bb54d3a6788ec6bf2eeA3a0D792Db3f23A",
+    "proxyImpl": "0x9B9233691bAAE1d9812c6BAFfa94d58Aca4327D2",
+    "usdcThroughIntegrator": false,
+    "note": "Submit the integrator + proxyImpl. Internal custody — there is NO vault. Source-verify on Basescan before the team finalises whitelisting."
+  },
+  "previousBuilds": [
+    {
+      "note": "v12: super-admin on BOTH integrator AND vault (external PayQRVault custody). Superseded by v13 internal-custody per audit H-1.",
+      "vault": "0x6436336b7F4514df08B30f42A54928738F171073",
+      "integrator": "0xC78222FFead42c8fc05A128966eb29590aD384d3",
+      "proxyImpl": "0x3D81777bdCb3E9B3D4Be10704eB24984474e6Ce1",
+      "client": "0x733De42AE944f0eFF2895aA76E7d73F5e948FCb3"
+    },
+    {
+      "note": "v11: super-admin on integrator only; vault still plain multi-owner (source-verified on Basescan)",
+      "vault": "0x39bf326c62C14464f2Fa4c4Bdd143388C69Dc468",
+      "integrator": "0x05653ECe4921E13088B2Bc7fDa53a89E27a1927d",
+      "proxyImpl": "0x6b82f1F6e81fB4Ec46135Ae45Cbb2D7E0F489E31",
+      "client": "0x1411dbFC688E501D953F48872f6f69C3B546abe2"
+    },
+    {
+      "note": "v10: pre-vault final audit (no vault/encryption/super-admin) — 73 tests",
+      "integrator": "0x66Fc15D3CC89f0090ca82A1308CbeBA85897E80e",
+      "proxyImpl": "0x5a8b584067E2AdE97fCc1Cb665885857221Bd587",
+      "client": "0x5C66483903bcDaAeC8Bc1735cc6D983Ab0ca98bC"
+    },
+    {
+      "note": "v9: 5-tier RBAC (VIEWER+FINANCE added)",
+      "integrator": "0x0bFF06a3247D3d3E25F11D56A7A7e65e19a7943D",
+      "client": "0xd340c12B6D22b2b2F403Bb5b3551f7DD928F13EE"
+    },
+    {
+      "note": "v8: thirdweb-migration audit (reconcile frozen re-lock, onlyAdmin removed)",
+      "integrator": "0xbC3a6EB31B799511DEF9a97800e285c2a39d5494",
+      "client": "0xe75154dc1119DE6c3F2d25b2d988220106E6bF1d"
+    },
+    {
+      "note": "v7: RBAC + full-audit fixes (payoutId/canonical-currency guards)",
+      "integrator": "0xbD3b217f0d4e26aBd8FC72A6F759F6bDF3a32a8C",
+      "client": "0x91DF57304BA10dBEBb4acdA32ed6Df42A9cbbA32"
+    },
+    {
+      "note": "v6: RBAC build",
+      "integrator": "0x3f905088033f62f23A790680F33FA74AD9BC8657",
+      "client": "0x48905094b8F74679bDba79e76679146A9F219bD6"
+    },
+    {
+      "note": "v5: final-audit build (cap-bypass fix)",
+      "integrator": "0xf0Ad956a3826430c81B279c88665D86761fb5325",
+      "client": "0x63d27Ea14FF5cF09BbAFE0b39225D7d76f24aD60"
+    },
+    {
+      "note": "v4: multi-admin flat model",
+      "integrator": "0xc93D0EdCDBe20B790D6229BdB70a1b39f82a3eCc",
+      "client": "0x5766864afD1B8C9796D54B45c04B7F3A34164F71"
+    },
+    {
+      "note": "v3: fixed INR-withdrawal circleId + setSellOrderUpi fee/allowance path",
+      "integrator": "0x5b7F7EE0e5E81CB9B0567ba2a7a0BC712E766F1f",
+      "client": "0x086079D5e8E8557Cfa7F4311CBDDd786D930632E"
+    },
+    {
+      "note": "v2: circleId-fixed but missing the SELL fee path",
+      "integrator": "0x48736033D58C71D52b7206f45D4D5BBBB31E6D0e",
+      "client": "0x1F6f4B93603933B600c82A5f9A18f04C9cd493FC"
+    },
+    {
+      "note": "v1: original whitelisted (circleId=0 + fee bugs)",
+      "integrator": "0xc5bC8D95a854e49cC720a06d768E9a115449cbCD",
+      "client": "0x6792B759f705f9eea818C12841bF424f1c732b3C"
+    }
+  ]
+}

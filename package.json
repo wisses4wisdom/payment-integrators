@@ -1,0 +1,48 @@
+{
+  "name": "@p2pdotme/payment-integrators",
+  "version": "0.1.0",
+  "description": "Open source P2P payment integrators for the P2P B2B checkout protocol.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/p2pdotme/payment-integrators.git"
+  },
+  "homepage": "https://github.com/p2pdotme/payment-integrators#readme",
+  "bugs": "https://github.com/p2pdotme/payment-integrators/issues",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "test:gas": "REPORT_GAS=true hardhat test",
+    "coverage": "hardhat coverage",
+    "clean": "hardhat clean",
+    "lint": "solhint 'contracts/**/*.sol'",
+    "format": "prettier --write 'contracts/**/*.sol' '{test,scripts}/**/*.ts'",
+    "format:check": "prettier --check 'contracts/**/*.sol' '{test,scripts}/**/*.ts'",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "dotenv": "^17.4.2",
+    "hardhat": "^2.22.14",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.0.5",
+    "prettier": "^3.3.3",
+    "prettier-plugin-solidity": "^1.4.1",
+    "solhint": "^5.0.3",
+    "solidity-coverage": "^0.8.17",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.0.1"
+  },
+  "lint-staged": {
+    "contracts/**/*.sol": [
+      "prettier --write",
+      "solhint"
+    ],
+    "{test,scripts}/**/*.{ts,js,json}": [
+      "prettier --write"
+    ]
+  }
+}
