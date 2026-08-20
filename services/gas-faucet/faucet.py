@@ -181,6 +181,11 @@ LIMITS = Limits(
     # themselves anyway, at double the price on every cap and half the float's
     # lifetime. (Review finding: the size was asserted, never argued.)
     safety_factor=_int_env("FAUCET_SAFETY_FACTOR", 2),
+    # The fixed priority tip a wallet adds on top of base fee, per gas. At
+    # Base's floor base fee this is most of what a wallet charges to sign, so
+    # the drip must provision it explicitly; a base-fee multiple alone can't.
+    # Default 0 keeps the old pure-multiple sizing until the env sets it.
+    wallet_tip_wei=_int_env("FAUCET_WALLET_TIP_WEI", 0),
     # Floors and ceilings in wei. At Base's usual 0.005 gwei the target lands
     # near 1.5e13 (~$0.03, ~2 journeys); the floor is the fee-spike safety net
     # and the ceiling stops a spike scaling the drip freely.
