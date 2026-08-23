@@ -47,12 +47,24 @@ export async function checkRateLimits(
 }
 
 /** Current gas price, with a floor so a zero reading cannot zero the budget. */
+/**
+ * Current gas price, for pricing a reservation in wei.
+ *
+ * Falls back HIGH, not low. A 1 wei fallback made both ceilings fail open at
+ * exactly the wrong moment: a flaky RPC is when spend is least observable, and
+ * pricing every reservation at 1 wei means the daily budget cannot be reached
+ * no matter what leaves the float. Assuming an expensive block instead means
+ * the worst case is refusing a payment we could have afforded, which is
+ * recoverable — the opposite is not.
+ */
+export const FALLBACK_GAS_PRICE = 2_000_000_000n; // 2 gwei — well above Base's usual
+
 export async function gasPriceFor(client: PublicClient): Promise<bigint> {
   try {
     const p = await client.getGasPrice();
-    return p > 0n ? p : 1n;
+    return p > 0n ? p : FALLBACK_GAS_PRICE;
   } catch {
-    return 1n;
+    return FALLBACK_GAS_PRICE;
   }
 }
 
@@ -77,31 +89,64 @@ export async function gasPriceFor(client: PublicClient): Promise<bigint> {
  * under-count on success, and `releaseGas` gives it back when the send never
  * happened.
  */
+export interface GasScope {
+  /** The link this spend is attributable to, if any. */
+  linkId?: string;
+  /** The merchant who owns that link, if known. */
+  merchant?: string;
+}
+
 export async function reserveGas(
   env: Env,
   sendGas: bigint,
-  gasPrice: bigint
+  gasPrice: bigint,
+  scope: GasScope = {}
 ): Promise<string | null> {
   const wei = sendGas * gasPrice;
   const stub = env.GAS_BUDGET.get(env.GAS_BUDGET.idFromName("relayer"));
   const res = (await (
     await stub.fetch("https://gas/reserve", {
       method: "POST",
-      body: JSON.stringify({ wei: wei.toString(), day: utcDay() }),
+      body: JSON.stringify({
+        wei: wei.toString(),
+        day: utcDay(),
+        linkId: scope.linkId,
+        merchant: scope.merchant,
+      }),
     })
   ).json()) as { ok: boolean; reason?: string };
 
   if (res.ok) return null;
   if (res.reason === "perTx") return "This payment could not be processed. Please try again.";
+  // AUDIT N2. Distinguish "this link/merchant has had its share today" from
+  // "the whole service is out of gas". The old message told a customer the
+  // service was down when in fact one link had been hammered — which is both
+  // wrong and the outcome an attacker was aiming for.
+  if (res.reason === "perLinkDay") {
+    return "This payment link has reached today's limit. Please try again tomorrow.";
+  }
+  if (res.reason === "perMerchantDay") {
+    return "This merchant has reached today's payment limit. Please try again tomorrow.";
+  }
   return "Payments are temporarily paused. Please try again later.";
 }
 
 /** Gives back a reservation for a transaction that was never broadcast. */
-export async function releaseGas(env: Env, sendGas: bigint, gasPrice: bigint): Promise<void> {
+export async function releaseGas(
+  env: Env,
+  sendGas: bigint,
+  gasPrice: bigint,
+  scope: GasScope = {}
+): Promise<void> {
   const stub = env.GAS_BUDGET.get(env.GAS_BUDGET.idFromName("relayer"));
   await stub.fetch("https://gas/release", {
     method: "POST",
-    body: JSON.stringify({ wei: (sendGas * gasPrice).toString(), day: utcDay() }),
+    body: JSON.stringify({
+      wei: (sendGas * gasPrice).toString(),
+      day: utcDay(),
+      linkId: scope.linkId,
+      merchant: scope.merchant,
+    }),
   });
 }
 

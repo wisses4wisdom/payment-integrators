@@ -30,13 +30,19 @@ import { decodeFunctionData, encodeFunctionData, type Address, type Hex } from "
 import { RELAY_INTENTS, ORDER_ID_ABI, INTEGRATOR_ABI, limitsFor, type Env } from "./config";
 import { publicClientFor, relayerFor } from "./chain";
 import { json, badRequest, clientIp, isAddress } from "./http";
+import { claimFromRequest, verifyClaim } from "./orderClaim";
 import { checkRateLimits, reserveGas, releaseGas, gasPriceFor } from "./limits";
+import { verifyTurnstile, turnstileTokenFrom } from "./turnstile";
 import { blockedForFalseClaims, falseClaimWarning, rememberMarkPaid } from "./claims";
 import { explainRevert } from "./pay";
 
 interface RelayBody {
   to?: string;
   data?: string;
+  /** Proof the caller is the customer this order was placed for. */
+  claimToken?: string;
+  /** Cloudflare Turnstile token (AUDIT N2). Header `cf-turnstile-response` also works. */
+  turnstileToken?: string;
 }
 
 const ZERO32 = "0x0000000000000000000000000000000000000000000000000000000000000000";
@@ -85,7 +91,26 @@ export async function handleRelayTx(req: Request, env: Env): Promise<Response> {
     .catch(() => ZERO32)) as Hex;
   if (!linkId || linkId === ZERO32) return json({ error: "Unsupported request." }, 403);
 
+  // 5 ── The caller must be the customer this order was placed for.
+  //
+  // Everything above establishes WHICH order. This establishes WHICH CALLER,
+  // and without it the endpoint advances anyone's order for anyone who asks:
+  // cancel a stranger mid-payment (their fiat has left their bank, the order is
+  // dead, markPaid now reverts, and they have no wallet to dispute with), or
+  // mark an unpaid order PAID so the LP finds nothing and the strike lands on
+  // the merchant. A missing record refuses — failing open would reinstate the
+  // hole, and such orders can still expire on the Diamond's own TTL.
+  if (!(await verifyClaim(env, orderId, claimFromRequest(req, body)))) {
+    return json({ error: "This payment session is no longer valid." }, 403);
+  }
+
   const ip = clientIp(req);
+
+  // AUDIT N2. Same human-cost gate as /api/pay. This endpoint also spends the
+  // relayer's gas, and a bot that can advance orders for free is a cheaper
+  // denial of service than one that can only place them.
+  const human = await verifyTurnstile(env, turnstileTokenFrom(req, body), ip);
+  if (!human.ok) return json({ error: human.message }, 403);
 
   // A customer who has already claimed "I have paid" on orders that then failed
   // to settle does not get to keep doing it. The chain records the strike for
@@ -131,7 +156,11 @@ export async function handleRelayTx(req: Request, env: Env): Promise<Response> {
   // Book what we will actually SEND, priced in wei — see limits.ts.
   const sendGas = (gas * limitsFor(env).gasBufferPct) / 100n;
   const gasPrice = await gasPriceFor(client);
-  const capped = await reserveGas(env, sendGas, gasPrice);
+  // AUDIT N2. Scoped by link. The merchant is not read here — it would cost an
+  // extra RPC round-trip on the hot path, and the per-link slice already bounds
+  // the blast radius of the order this call is advancing.
+  const gasScope = { linkId: String(linkId) };
+  const capped = await reserveGas(env, sendGas, gasPrice, gasScope);
   if (capped) return json({ error: capped }, 503);
 
   const nonceStub = env.NONCE.get(env.NONCE.idFromName("relayer"));
@@ -166,7 +195,7 @@ export async function handleRelayTx(req: Request, env: Env): Promise<Response> {
 
     return json({ hash });
   } catch (err) {
-    await releaseGas(env, sendGas, gasPrice);
+    await releaseGas(env, sendGas, gasPrice, gasScope);
     await nonceStub.fetch("https://nonce/resync");
     return json({ error: explainRevert(err) }, 502);
   }

@@ -12,6 +12,18 @@ export interface Env {
   RELAYER_PRIVATE_KEY: string;
   /** HMAC key for outbound webhook signatures. */
   WEBHOOK_SIGNING_KEY: string;
+  /**
+   * Cloudflare Turnstile secret. Presence of this secret is what ENABLES the
+   * human-cost gate on `/api/pay` and `/api/relay-tx` (AUDIT N2).
+   *
+   * Optional so local dev and the e2e suite run without one. That is a
+   * deliberate fail-OPEN, which is only defensible because the alternative —
+   * a hard requirement — would make the tests unrunnable and get the check
+   * disabled wholesale. `/health` reports whether the gate is live, and
+   * `REQUIRE_TURNSTILE=true` turns the omission into a startup-visible 503
+   * so a production deploy cannot quietly ship without it.
+   */
+  TURNSTILE_SECRET?: string;
 
   // ─── Vars (wrangler.toml) ───────────────────────────────────────
   RPC_URL: string;
@@ -45,6 +57,17 @@ export interface Env {
   WEBHOOK_BATCH?: string;
   /** Seconds a single-use link is held while a payment is in flight. */
   LINK_LOCK_SECONDS?: string;
+  /**
+   * Per-link and per-merchant daily gas ceilings, in wei (AUDIT N2).
+   * Sub-budgets of MAX_GAS_WEI_PER_DAY — see DEFAULT_LIMITS.
+   */
+  MAX_GAS_WEI_PER_LINK_PER_DAY?: string;
+  MAX_GAS_WEI_PER_MERCHANT_PER_DAY?: string;
+  /**
+   * "true" to refuse service when TURNSTILE_SECRET is unset, rather than
+   * running with the gate open. Set this in production.
+   */
+  REQUIRE_TURNSTILE?: string;
 
   // ─── Bindings ───────────────────────────────────────────────────
   KV: KVNamespace;
@@ -107,6 +130,22 @@ export const DEFAULT_LIMITS = {
   webhookBatch: 50,
   /** How long one link is held while a payment is in flight. */
   linkLockSeconds: 60,
+  /**
+   * Per-link and per-merchant slices of the daily budget (AUDIT N2).
+   *
+   * The global ceiling alone did not bound BLAST RADIUS, only total spend:
+   * one IP hammering a couple of public links could consume the whole day's
+   * float and darken every other merchant's link until UTC midnight. The
+   * budget built to protect the float was the cheapest way to take the
+   * service down.
+   *
+   * Sized as 20% and 10% of the daily total, so it takes five busy merchants
+   * to exhaust the day and no single link can take more than a tenth. At
+   * Base's typical cost per placement that is still hundreds of payments per
+   * link per day — far above real use, and far below a denial of service.
+   */
+  maxGasWeiPerMerchantPerDay: 2_000_000_000_000_000n, // 20% of the day
+  maxGasWeiPerLinkPerDay: 1_000_000_000_000_000n, //     10% of the day
 } as const;
 
 /**
@@ -155,6 +194,11 @@ export function limitsFor(env: Env): Limits {
     logScanBlocks: big(env.LOG_SCAN_BLOCKS, d.logScanBlocks),
     webhookBatch: num(env.WEBHOOK_BATCH, d.webhookBatch),
     linkLockSeconds: num(env.LINK_LOCK_SECONDS, d.linkLockSeconds),
+    maxGasWeiPerMerchantPerDay: big(
+      env.MAX_GAS_WEI_PER_MERCHANT_PER_DAY,
+      d.maxGasWeiPerMerchantPerDay
+    ),
+    maxGasWeiPerLinkPerDay: big(env.MAX_GAS_WEI_PER_LINK_PER_DAY, d.maxGasWeiPerLinkPerDay),
   };
 }
 
@@ -164,6 +208,65 @@ export function productIdFor(env: Env): bigint {
 }
 
 /** Only what the Worker actually calls. A narrow ABI is a narrow blast radius. */
+
+/**
+ * Every custom error a link payment can revert with, including the
+ * `CallFailed(bytes)` wrapper that `UserProxy` puts around a Diamond revert.
+ *
+ * These were absent, and the cost was invisible locally: a hardhat node
+ * decodes error NAMES from its own artifacts and prints them in the message,
+ * so string-matching on the name appeared to work. Public RPCs return
+ * `execution reverted` plus raw data and nothing else, so in production every
+ * branch degraded to the generic message — expired, used up, revoked, halted,
+ * frozen, over-cap and paused all told the customer the same unhelpful thing.
+ */
+export const INTEGRATOR_ERRORS = [
+  { type: "error", name: "CallFailed", inputs: [{ name: "reason", type: "bytes" }] },
+  { type: "error", name: "LinkExpired", inputs: [] },
+  { type: "error", name: "LinkAlreadyUsed", inputs: [] },
+  { type: "error", name: "LinkNotActive", inputs: [] },
+  { type: "error", name: "LinkNotFound", inputs: [] },
+  { type: "error", name: "LinkAmountMismatch", inputs: [] },
+  { type: "error", name: "LinkOrdersDisabled", inputs: [] },
+  { type: "error", name: "OnlyTrustedRelayer", inputs: [] },
+  { type: "error", name: "MerchantIsFrozen", inputs: [] },
+  { type: "error", name: "ExceedsPerTxCap", inputs: [] },
+  { type: "error", name: "DailyLimitReached", inputs: [] },
+  { type: "error", name: "NotRegistered", inputs: [] },
+  { type: "error", name: "InvalidCurrency", inputs: [] },
+  { type: "error", name: "InvalidQuantity", inputs: [] },
+  { type: "error", name: "ProductNotFound", inputs: [] },
+  { type: "error", name: "Paused", inputs: [] },
+  { type: "error", name: "Reentrancy", inputs: [] },
+] as const;
+
+/**
+ * Selector → customer-facing message.
+ *
+ * Keyed on the SELECTOR rather than the name, because the selector is the only
+ * thing every RPC returns. Verified by recomputing keccak256 of each signature.
+ */
+export const REVERT_MESSAGES: Record<string, string> = {
+  "0x81a36e7f": "This payment link has expired.",
+  "0x8f4f4b10": "This payment link has already been used the maximum number of times.",
+  "0x185214e4": "This payment link has been cancelled.",
+  "0x3b82cbf1": "This payment link was not found.",
+  "0x5723c737": "The amount has changed. Please reload the page.",
+  "0x410bccb3": "Link payments are temporarily unavailable. Please try again later.",
+  "0x961ec64f": "This payment could not be processed. Please try again.",
+  "0xe2df7fb3": "This merchant cannot accept payments right now.",
+  "0x49aeece1": "This amount is above the limit for this merchant.",
+  "0xf402e5b1": "This merchant has reached today's payment limit. Please try again tomorrow.",
+  "0xaba47339": "This merchant is not set up to accept payments.",
+  "0xf5993428": "This link's currency is not supported right now.",
+  "0x524f409b": "Please enter a valid amount.",
+  "0x79de4af5": "This link is not payable right now.",
+  "0x9e87fac8": "Payments are temporarily paused. Please try again later.",
+  "0xab143c06": "This payment is already being processed.",
+};
+
+/** `CallFailed(bytes)` — UserProxy wrapping an inner Diamond revert. */
+export const CALL_FAILED_SELECTOR = "0xa5fa8d2b";
 export const INTEGRATOR_ABI = [
   {
     type: "function",

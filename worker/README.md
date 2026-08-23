@@ -3,7 +3,7 @@
 Places orders on a merchant's behalf when a walletless customer pays a link.
 
 The merchant is asleep, the customer has no wallet, and someone has to sign a
-transaction. This Worker holds a wallet that can call exactly one function on
+transaction. This Worker holds a wallet that can call exactly three functions on
 our integrator — `relayerPlaceOrder` — and is never a registered merchant, so
 it has no path to anyone's funds.
 
@@ -109,8 +109,18 @@ Measured from the contract's own gas report:
 | At 0.01 gwei on Base | **~$0.01 per payment** |
 | A 0.05 ETH float | **~14,000 payments** |
 
-The daily gas cap (`LIMITS.maxGasPerDay`) bounds a spam campaign to roughly
-1,400 payments' worth of gas per UTC day. Balance warnings fire at 0.015 ETH —
+Those figures assume Base's usual gas price. The ceilings below are denominated
+in **wei**, not gas units, precisely so that assumption is not load-bearing: a
+price spike buys fewer payments out of the same budget instead of quietly
+draining more value than intended.
+
+One cost this does NOT capture: on Base the L1 data fee is often the larger
+half of a transaction's real cost, and `gasPrice * gas` does not include it. The
+wei budget therefore under-counts what actually leaves the float. Treat the
+daily ceiling as a floor on protection rather than an exact spend cap.
+
+The daily gas cap (`LIMITS.maxGasWeiPerDay`) bounds a spam campaign to roughly
+1,600 payments' worth of spend per UTC day at Base's usual gas price. Balance warnings fire at 0.015 ETH —
 while there is still time to act, not once the float is gone.
 
 ## Configuration
@@ -145,7 +155,7 @@ measured gas report rather than guessed.
 | `RATE_IP_PER_MINUTE` | 10 | first line against spam, before any RPC |
 | `RATE_LINK_PER_HOUR` | 20 | a link is a public endpoint |
 | `MAX_GAS_PER_TX` | 600,000 | anomaly detector — measured max is ~398k |
-| `MAX_GAS_PER_DAY` | 840,000,000 | ~1,400 payments ≈ $14/day |
+| `MAX_GAS_WEI_PER_DAY` | 0.01 ETH | ~1,600 payments at 0.01 gwei |
 | `GAS_BUFFER_PCT` | 120 | head-room over the estimate |
 | `LOW_BALANCE_WEI` | 0.015 ETH | ~4,300 payments of runway left |
 | `RECEIPT_TIMEOUT_MS` | 45,000 | raise on a slow RPC |
@@ -174,7 +184,9 @@ wrangler deploy                    # testnet
 wrangler deploy --env production   # mainnet
 ```
 
-On-chain, once: `setTrustedRelayer(<relayer address>)`, then fund that address
+On-chain, once: `setLinkRelayer(<relaying key>, true)` for each key in the pool
+— these are SEPARATE from `setTrustedRelayer`, which now carries only the fiat
+keeper duty — then fund each address
 with a small ETH float. Confirm with `GET /health`.
 
 If the relayer runs dry, link payments fail visibly with no risk to funds — it

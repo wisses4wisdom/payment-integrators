@@ -19,6 +19,19 @@ export function corsHeaders(env: Env, origin: string | null): Record<string, str
   };
 }
 
+/**
+ * Canonical form of a link id: lowercase hex.
+ *
+ * Hex is case-insensitive, so `0xAB…` and `0xab…` are the SAME link — but they
+ * are different strings, and the per-link lock, the per-link rate limit and the
+ * webhook lookup were all keyed on the raw string. Case-flipping therefore
+ * bypassed the lock and the limiter, and a webhook registered in one case was
+ * never found for an order placed in the other.
+ */
+export function normalizeLinkId(raw: string): string {
+  return raw.trim().toLowerCase();
+}
+
 export function json(body: unknown, status = 200, extra: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), {
     status,

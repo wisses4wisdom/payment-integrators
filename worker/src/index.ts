@@ -16,6 +16,7 @@ import { handlePay } from "./pay";
 import { handleRelayTx } from "./relayTx";
 import { handleRegisterWebhook, scanAndQueue, deliverQueued, sweepFalseClaims } from "./webhooks";
 import { json, corsHeaders } from "./http";
+import { turnstileEnabled } from "./turnstile";
 
 export { LinkLock, NonceManager, GasBudget } from "./durable";
 
@@ -94,6 +95,11 @@ async function health(env: Env): Promise<Response> {
       ok: true,
       lowBalance: balance < limitsFor(env).lowBalanceWei,
       block: block.toString(),
+      // AUDIT N2. Whether the human-cost gate is actually live is not
+      // something an operator should have to infer from a deploy log. It is
+      // a boolean, not the secret, so it leaks nothing an attacker could not
+      // learn by sending one request.
+      turnstile: turnstileEnabled(env),
     });
   } catch {
     // Never echo the upstream error — it can carry the RPC URL and key material

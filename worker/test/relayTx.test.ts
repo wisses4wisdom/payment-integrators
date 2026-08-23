@@ -113,20 +113,36 @@ describe("link payability", () => {
 
 describe("customer-facing error messages", () => {
   it("translates every link revert into something a person can act on", () => {
+    // Keyed on SELECTORS, because that is all a public RPC returns. The old
+    // version fed error NAMES in the message, which only ever worked because a
+    // hardhat node decodes them from its own artifacts and prints them — so
+    // the test passed locally while every branch was dead in production.
     const cases: [string, RegExp][] = [
-      ["LinkExpired()", /expired/i],
-      ["LinkAlreadyUsed()", /already been used/i],
-      ["LinkNotActive()", /cancelled/i],
-      ["LinkNotFound()", /not found/i],
-      ["LinkAmountMismatch()", /reload/i],
-      ["LinkOrdersDisabled()", /temporarily unavailable/i],
-      ["MerchantIsFrozen()", /cannot accept payments/i],
-      ["DailyLimitReached()", /today's payment limit/i],
-      ["ExceedsPerTxCap()", /above the limit/i],
+      ["0x81a36e7f", /expired/i], // LinkExpired
+      ["0x8f4f4b10", /already been used/i], // LinkAlreadyUsed
+      ["0x185214e4", /cancelled/i], // LinkNotActive
+      ["0x3b82cbf1", /not found/i], // LinkNotFound
+      ["0x5723c737", /reload/i], // LinkAmountMismatch
+      ["0x410bccb3", /temporarily unavailable/i], // LinkOrdersDisabled
+      ["0xe2df7fb3", /cannot accept payments/i], // MerchantIsFrozen
+      ["0xf402e5b1", /today's payment limit/i], // DailyLimitReached
+      ["0x49aeece1", /above the limit/i], // ExceedsPerTxCap
     ];
-    for (const [revert, expected] of cases) {
-      expect(explainRevert(new Error(`execution reverted: ${revert}`))).toMatch(expected);
+    for (const [selector, expected] of cases) {
+      // Shaped like a viem revert: the payload hangs off the cause chain,
+      // and the message says nothing useful — exactly as a Base RPC returns it.
+      const err = Object.assign(new Error("execution reverted"), {
+        cause: { data: selector },
+      });
+      expect(explainRevert(err)).toMatch(expected);
     }
+  });
+
+  it("still falls back gracefully when there is no revert data at all", () => {
+    expect(explainRevert(new Error("network unreachable"))).toMatch(/could not be started/i);
+    expect(explainRevert(new Error("insufficient funds for gas"))).toMatch(
+      /temporarily unavailable/i
+    );
   });
 
   it("decodes reverts that arrive WRAPPED from inside the Diamond call", () => {

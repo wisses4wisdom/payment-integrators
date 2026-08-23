@@ -16,7 +16,11 @@ INTEGRATOR_ADDRESS = "0x0000000000000000000000000000000000000000"  # set after d
 DIAMOND_ADDRESS = "0x0000000000000000000000000000000000000000"
 CLIENT_ADDRESS = "0x0000000000000000000000000000000000000000"
 # The productId the pinned client prices a single unit at.
-PRODUCT_ID = "1"
+# Product 2, NOT 1. scripts/deploy-merchant-terminal.ts prices product 2 at one
+# 6-decimal unit and leaves product 1 at zero, so pointing here at 1 makes
+# unitPrice() return 0 and every link reports "not payable right now" on a
+# fresh deploy. The e2e fixture happens to price product 1, which hid this.
+PRODUCT_ID = "2"
 # Lock the pay endpoint to your own domains once they are known. Left empty
 # the endpoint is open, which is correct for a public pay page.
 # Leaving this empty makes corsHeaders fall back to "*", which lets any site
@@ -42,8 +46,39 @@ RATE_LINK_PER_HOUR = "20"
 # Gas ceilings. relayerPlaceOrder measures ~348k average, ~398k max — 600k is
 # an anomaly detector, not a working limit. The daily cap bounds a spam wave
 # to roughly 1,400 payments' worth of gas; at ~$0.01 each that is ~$14/day.
-MAX_GAS_PER_TX = "600000"
-MAX_GAS_PER_DAY = "840000000"
+# Ceilings on relayer spend, in WEI. These names must match what config.ts
+# reads: they were MAX_GAS_PER_* here and MAX_GAS_WEI_PER_* in the code, so
+# every value set here was silently ignored and the defaults applied — the
+# worst kind of knob, one that looks connected and is not.
+#
+# Sized off the FLOAT, not off an assumed gas price. Pricing them at Base's
+# usual 0.01 gwei produced ceilings that refused every payment the moment the
+# chain reached ~1 gwei.
+MAX_GAS_WEI_PER_TX = "1000000000000000"
+MAX_GAS_WEI_PER_DAY = "10000000000000000"
+
+# Per-link and per-merchant slices of that daily budget (AUDIT N2).
+#
+# A global ceiling bounds total spend but not BLAST RADIUS: one IP hammering
+# a couple of public links could consume the whole day's float and darken
+# every other merchant's link until UTC midnight, which made the control
+# built to protect the float the cheapest way to switch the service off.
+# 20% and 10% of the day, so it takes five busy merchants to exhaust it and
+# no single link can take more than a tenth.
+MAX_GAS_WEI_PER_MERCHANT_PER_DAY = "2000000000000000"
+MAX_GAS_WEI_PER_LINK_PER_DAY = "1000000000000000"
+
+# Cloudflare Turnstile (AUDIT N2). Placement is anonymous and the relayer
+# pays for it, so counters ration the wrong thing — requests are free to an
+# attacker and every one that lands costs a real transaction and a real slot
+# out of a merchant's daily limit. Turnstile charges for the one resource an
+# attacker actually lacks, without asking the customer who they are.
+#
+# The SECRET goes in via `wrangler secret put TURNSTILE_SECRET` — never here.
+# Leave REQUIRE_TURNSTILE unset on testnet so the e2e suite runs; set it to
+# "true" in production so a missing secret is a loud 503 rather than an open
+# door nobody noticed.
+# REQUIRE_TURNSTILE = "true"
 # Head-room over the estimate, as a percentage. 120 = +20%.
 GAS_BUFFER_PCT = "120"
 
@@ -100,7 +135,11 @@ RPC_URL = "https://mainnet.base.org"
 INTEGRATOR_ADDRESS = "0x0000000000000000000000000000000000000000"
 DIAMOND_ADDRESS = "0x0000000000000000000000000000000000000000"
 CLIENT_ADDRESS = "0x0000000000000000000000000000000000000000"
-PRODUCT_ID = "1"
+# Product 2, NOT 1. scripts/deploy-merchant-terminal.ts prices product 2 at one
+# 6-decimal unit and leaves product 1 at zero, so pointing here at 1 makes
+# unitPrice() return 0 and every link reports "not payable right now" on a
+# fresh deploy. The e2e fixture happens to price product 1, which hid this.
+PRODUCT_ID = "2"
 # Mainnet: pin the pay endpoint to your own origins.
 # Leaving this empty makes corsHeaders fall back to "*", which lets any site
 # call /api/pay and /api/relay-tx. Defensible for a public pay page, but it
@@ -111,11 +150,55 @@ ALLOWED_ORIGINS = "https://pay.p2p.me"
 # volume rather than guessing high.
 RATE_IP_PER_MINUTE = "10"
 RATE_LINK_PER_HOUR = "20"
-MAX_GAS_PER_TX = "600000"
-MAX_GAS_PER_DAY = "420000000"
+# In WEI — see the note on the default environment.
+MAX_GAS_WEI_PER_TX = "1000000000000000"
+MAX_GAS_WEI_PER_DAY = "5000000000000000"
+# Sub-budgets, at the same 20% / 10% ratio as the default environment.
+MAX_GAS_WEI_PER_MERCHANT_PER_DAY = "1000000000000000"
+MAX_GAS_WEI_PER_LINK_PER_DAY = "500000000000000"
+# Mainnet ships with the gate MANDATORY. Set the secret first:
+#   wrangler secret put TURNSTILE_SECRET --env production
+REQUIRE_TURNSTILE = "true"
 GAS_BUFFER_PCT = "120"
 LOW_BALANCE_WEI = "30000000000000000"
 RECEIPT_TIMEOUT_MS = "45000"
 LOG_SCAN_BLOCKS = "800"
 WEBHOOK_BATCH = "50"
 LINK_LOCK_SECONDS = "60"
+
+# ─── Production bindings ──────────────────────────────────────────────
+#
+# These MUST be repeated. `kv_namespaces`, `durable_objects.bindings` and
+# `migrations` are non-inheritable keys in wrangler: a named environment does
+# not pick them up from the top level. Without this block
+# `wrangler deploy --env production` ships a Worker where `env.KV` is
+# undefined, so the first mainnet request dies in an uncaught TypeError and
+# returns 500 with no CORS headers. Testnet works; mainnet is dead on arrival.
+#
+# Secrets are per-environment too — `wrangler secret put NAME --env production`.
+# Without the flag they land on the default environment only.
+
+[[env.production.kv_namespaces]]
+binding = "KV"
+id = "REPLACE_WITH_PRODUCTION_KV_NAMESPACE_ID"
+
+[[env.production.durable_objects.bindings]]
+name = "LINK_LOCK"
+class_name = "LinkLock"
+
+[[env.production.durable_objects.bindings]]
+name = "NONCE"
+class_name = "NonceManager"
+
+[[env.production.durable_objects.bindings]]
+name = "GAS_BUDGET"
+class_name = "GasBudget"
+
+[[env.production.migrations]]
+tag = "v1"
+new_classes = ["LinkLock", "NonceManager", "GasBudget"]
+
+# The scheduled run has to exist here too, or completions are never confirmed
+# and no webhook is ever delivered on mainnet.
+[env.production.triggers]
+crons = ["*/5 * * * *"]

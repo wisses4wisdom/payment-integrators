@@ -81,8 +81,14 @@ export async function readLink(client: PublicClient, env: Env, linkId: Hex): Pro
       uses: r[6],
       strikes: r[7],
     };
-  } catch {
-    return null;
+  } catch (err) {
+    // A link that does not exist reverts LinkNotFound. Anything else — a
+    // timeout, a rate-limited RPC, a bad URL — is OUR problem, and telling the
+    // customer "this link was not found" sends them to argue with a merchant
+    // about a link that is perfectly fine. Distinguish the two.
+    const s = String((err as Error)?.message ?? err);
+    if (s.includes("0x3b82cbf1") || s.includes("LinkNotFound")) return null;
+    throw err;
   }
 }
 
@@ -110,19 +116,4 @@ export function linkBlockedReason(link: Link, nowSec: number): string | null {
   if (link.maxUses !== 0 && link.uses >= link.maxUses)
     return "This payment link has already been used the maximum number of times.";
   return null;
-}
-
-/** True once the contract has recorded this order — our proof it is ours. */
-export async function orderIsOurs(
-  client: PublicClient,
-  env: Env,
-  orderId: bigint
-): Promise<boolean> {
-  const merchant = (await client.readContract({
-    address: env.INTEGRATOR_ADDRESS as Address,
-    abi: INTEGRATOR_ABI,
-    functionName: "orderToMerchant",
-    args: [orderId],
-  })) as Address;
-  return merchant !== "0x0000000000000000000000000000000000000000";
 }

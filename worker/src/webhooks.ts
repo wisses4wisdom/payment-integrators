@@ -13,7 +13,14 @@
  * the HMAC signature is what authenticates delivery.
  */
 
-import { decodeEventLog, hashMessage, recoverAddress, type Address, type Hex } from "viem";
+import {
+  decodeEventLog,
+  hashMessage,
+  recoverAddress,
+  type Address,
+  type Hex,
+  type PublicClient,
+} from "viem";
 import { INTEGRATOR_ABI, limitsFor, type Env } from "./config";
 import { publicClientFor } from "./chain";
 import { json, badRequest, clientIp } from "./http";
@@ -86,6 +93,22 @@ export async function handleRegisterWebhook(req: Request, env: Env): Promise<Res
   }
   if (parsed.protocol !== "https:") return badRequest("Webhook URLs must use HTTPS.");
 
+  // A webhook pointing back at this Worker turns delivery into a loop: the
+  // merchant's own retry schedule quietly spends their rate limit and the
+  // shared gas float. Self-inflicted, but nothing else here would stop it, and
+  // there is no legitimate reason to register our own origin as a callback.
+  if (isSelfTarget(parsed, req)) {
+    return badRequest("That webhook URL points back at this service.");
+  }
+
+  // A webhook pointing back at this Worker turns delivery into a loop: the
+  // merchant's own retry schedule quietly spends their rate limit and the
+  // shared gas float. Self-inflicted, but nothing else here would stop it, and
+  // there is no legitimate reason to register our own origin as a callback.
+  if (isSelfTarget(parsed, req)) {
+    return badRequest("That webhook URL points back at this service.");
+  }
+
   // Unmetered before this point it was a free KV-write amplifier.
   const limited = await checkRateLimits(env, `hook:${linkId}`, clientIp(req));
   if (limited) return json({ error: limited }, 429);
@@ -134,6 +157,22 @@ export async function handleRegisterWebhook(req: Request, env: Env): Promise<Res
   return json({ ok: true });
 }
 
+/**
+ * Whether a registered callback would loop back into this Worker.
+ *
+ * Host comparison only — resolving names is not available here, and Cloudflare's
+ * edge already blocks private and link-local ranges, so the gap actually worth
+ * closing is the self-referential one.
+ */
+function isSelfTarget(target: URL, req: Request): boolean {
+  try {
+    const self = new URL(req.url);
+    return target.host.toLowerCase() === self.host.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
 /** HMAC-SHA256 over the raw body, hex-encoded. */
 async function sign(secret: string, payload: string): Promise<string> {
   const key = await crypto.subtle.importKey(
@@ -161,6 +200,44 @@ interface Pending {
  * newly completed link order. Confirmation comes from the CHAIN, never from a
  * client ping.
  */
+/**
+ * Which link an order came from.
+ *
+ * Prefers the record the pay path writes, and falls back to the contract,
+ * which is the authority: `orderToLink` is set inside `relayerPlaceOrder`, so
+ * it exists for every link order whether or not the service managed to record
+ * it. A POS order has no entry and returns null, which is how link orders are
+ * told apart from counter sales.
+ */
+async function linkIdFor(env: Env, client: PublicClient, orderId: bigint): Promise<string | null> {
+  const meta = await env.KV.get(`order:${orderId}`);
+  if (meta) {
+    try {
+      const { linkId } = JSON.parse(meta) as { linkId?: string };
+      if (linkId) return linkId.toLowerCase();
+    } catch {
+      // fall through to the chain
+    }
+  }
+
+  const onChain = (await client
+    .readContract({
+      address: env.INTEGRATOR_ADDRESS as Address,
+      abi: INTEGRATOR_ABI,
+      functionName: "orderToLink",
+      args: [orderId],
+    })
+    .catch(() => null)) as string | null;
+
+  if (!onChain || /^0x0{64}$/.test(onChain)) return null;
+
+  // Cache the recovered binding so the next scan does not pay for it again.
+  await env.KV.put(`order:${orderId}`, JSON.stringify({ linkId: onChain.toLowerCase() }), {
+    expirationTtl: 2_592_000,
+  });
+  return onChain.toLowerCase();
+}
+
 export async function scanAndQueue(env: Env): Promise<number> {
   const client = publicClientFor(env);
   const latest = await client.getBlockNumber();
@@ -208,10 +285,14 @@ export async function scanAndQueue(env: Env): Promise<number> {
       amount: bigint;
     };
 
-    // Only link orders — a POS sale has no linkId recorded here.
-    const meta = await env.KV.get(`order:${orderId}`);
-    if (!meta) continue;
-    const { linkId } = JSON.parse(meta) as { linkId: string };
+    // Only link orders — a POS sale has no link at all.
+    //
+    // The KV record is written after the receipt lands, so a slow confirmation
+    // (the 202 path) never writes it: the customer pays, the LP completes, and
+    // the merchant's notification is silently dropped for the one order that
+    // took longest. The binding is on-chain regardless, so fall back to it.
+    const linkId = await linkIdFor(env, client, orderId);
+    if (!linkId) continue;
 
     if (await env.KV.get(`hook:sent:${orderId}`)) continue;
     const url = await env.KV.get(`hook:${linkId}`);
