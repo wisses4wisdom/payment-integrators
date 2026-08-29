@@ -8,10 +8,37 @@
 
 export interface Env {
   // ─── Secrets (wrangler secret put) ──────────────────────────────
-  /** The relayer EOA's key. Its ONLY on-chain power is relayerPlaceOrder. */
+  /**
+   * @deprecated Being removed. The funded relayer EOA is what the review
+   * rejected: a single point of failure, no spending limits, and one nonce
+   * sequence that blocks under load. Payments now go through `LinkRouter`,
+   * signed by a per-link wallet that holds nothing (see `linkWallet.ts`).
+   *
+   * Kept only while the old path runs alongside the new one. Delete this,
+   * `relayerFor()`, and the `NonceManager` durable object together, once
+   * link traffic is fully on the Router.
+   */
   RELAYER_PRIVATE_KEY: string;
   /** HMAC key for outbound webhook signatures. */
   WEBHOOK_SIGNING_KEY: string;
+  /**
+   * Master secret for wrapping per-link wallet keys, base64, 32 bytes.
+   *
+   * This replaces a FUNDED key with an ENCRYPTION key, which is the point: it
+   * holds no money, so losing it costs availability rather than funds. Losing
+   * it and the key store together yields every link's signing key — and those
+   * still cannot mark paid, cancel, or move any asset, because those need the
+   * customer's own signature, which we never hold.
+   *
+   * In production this should be a handle to a managed key service rather than
+   * raw material here, so every unwrap is logged and the credential is
+   * revocable. Only `linkWallet.importMaster` changes when that happens.
+   */
+  LINK_KEY_MASTER: string;
+  /** Shared secret the sponsorship provider presents to `/api/sponsor-check`.
+   *  Without it an outsider could burn a link's sponsorship allowance without
+   *  ever sending a transaction. */
+  SPONSOR_VERIFIER_SECRET?: string;
   /**
    * Cloudflare Turnstile secret. Presence of this secret is what ENABLES the
    * human-cost gate on `/api/pay` and `/api/relay-tx` (AUDIT N2).
@@ -30,6 +57,14 @@ export interface Env {
   CHAIN_ID: string;
   INTEGRATOR_ADDRESS: string;
   DIAMOND_ADDRESS: string;
+  /** The LinkRouter, which is the integrator's `trustedRelayer`. Every link
+   *  payment goes through it; it holds nothing and cannot move value. */
+  LINK_ROUTER_ADDRESS: string;
+  /** Sponsored-operation ceiling per link, over the link's lifetime. This is
+   *  what bounds the place-and-cancel loop: cancelling refunds the link's use
+   *  (`onOrderCancel` does `cl.uses--`), so `maxUses` caps concurrent orders,
+   *  not total attempts. Defaults to 20. */
+  MAX_SPONSORED_OPS_PER_LINK?: string;
   /** The checkout client the widget prices against. Pinned, not caller-supplied. */
   CLIENT_ADDRESS: string;
   /** The productId the client prices a single unit at. Defaults to 1. */
@@ -451,3 +486,116 @@ export const ORDER_ID_ABI = [
     outputs: [],
   },
 ] as const;
+
+/**
+ * LinkRouter — the integrator's `trustedRelayer`, replacing the funded EOA.
+ *
+ * Note the shape of every entry: `linkId` comes FIRST on all three payment
+ * calls. That is deliberate rather than incidental — the sponsorship verifier
+ * decodes one argument to learn which link an operation belongs to, so there is
+ * no call we can be asked to pay for without being able to attribute it.
+ *
+ * `markPaid` and `cancel` additionally carry the customer's own signature. The
+ * link wallet's key alone cannot settle or cancel anything; that signature is
+ * generated in the customer's browser and we never hold it, which is what makes
+ * a full compromise of this worker unable to advance a payment.
+ */
+export const LINK_ROUTER_ABI = [
+  {
+    type: "function",
+    name: "registerAgent",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "linkId", type: "bytes32" },
+      { name: "agent", type: "address" },
+    ],
+    outputs: [],
+  },
+  {
+    type: "function",
+    name: "place",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "linkId", type: "bytes32" },
+      { name: "client", type: "address" },
+      { name: "productId", type: "uint256" },
+      { name: "quantity", type: "uint256" },
+      { name: "currency", type: "bytes32" },
+      { name: "circleId", type: "uint256" },
+      { name: "pubKey", type: "string" },
+      { name: "customer", type: "address" },
+    ],
+    outputs: [{ type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "markPaid",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "linkId", type: "bytes32" },
+      { name: "orderId", type: "uint256" },
+      { name: "signature", type: "bytes" },
+    ],
+    outputs: [],
+  },
+  {
+    type: "function",
+    name: "cancel",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "linkId", type: "bytes32" },
+      { name: "orderId", type: "uint256" },
+      { name: "signature", type: "bytes" },
+    ],
+    outputs: [],
+  },
+  {
+    type: "function",
+    name: "linkAgent",
+    stateMutability: "view",
+    inputs: [{ name: "linkId", type: "bytes32" }],
+    outputs: [{ type: "address" }],
+  },
+  {
+    type: "function",
+    name: "orderCustomer",
+    stateMutability: "view",
+    inputs: [{ name: "orderId", type: "uint256" }],
+    outputs: [{ type: "address" }],
+  },
+  {
+    type: "function",
+    name: "markPaidDigest",
+    stateMutability: "view",
+    inputs: [
+      { name: "linkId", type: "bytes32" },
+      { name: "orderId", type: "uint256" },
+    ],
+    outputs: [{ type: "bytes32" }],
+  },
+  {
+    type: "function",
+    name: "cancelDigest",
+    stateMutability: "view",
+    inputs: [
+      { name: "linkId", type: "bytes32" },
+      { name: "orderId", type: "uint256" },
+    ],
+    outputs: [{ type: "bytes32" }],
+  },
+] as const;
+
+/**
+ * Router revert selectors, for turning a failure into something a customer can
+ * act on. Computed from the signatures in LinkRouter.sol.
+ */
+export const ROUTER_ERRORS: Record<string, string> = {
+  NotLinkAgent: "This payment link is not set up correctly. Ask the merchant to re-issue it.",
+  NotLinkOwner: "Only the merchant who created this link can change it.",
+  AgentAlreadySet: "This link is already set up.",
+  UnknownOrder: "That order was not created through this link.",
+  OrderLinkMismatch: "That order belongs to a different link.",
+  BadCustomerSignature: "We could not verify this came from you. Please reload the page and try again.",
+  ZeroAddress: "Invalid address.",
+  Reentrancy: "Please try again.",
+};

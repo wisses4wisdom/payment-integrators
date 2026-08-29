@@ -17,6 +17,7 @@ import { handleRelayTx } from "./relayTx";
 import { handleRegisterWebhook, scanAndQueue, deliverQueued, sweepFalseClaims } from "./webhooks";
 import { json, corsHeaders } from "./http";
 import { turnstileEnabled } from "./turnstile";
+import { handleSponsorCheck } from "./sponsor";
 
 export { LinkLock, NonceManager, GasBudget } from "./durable";
 
@@ -40,6 +41,11 @@ export default {
       res = await handleRelayTx(req, env);
     } else if (req.method === "POST" && path === "/api/links") {
       res = await handleRegisterWebhook(req, env);
+    } else if (req.method === "POST" && path === "/api/sponsor-check") {
+      // Called by the sponsorship provider, not by users. This is where the
+      // per-link ceiling lives — the built-in rules are global only, so it is
+      // not a dashboard setting and must not be described as one.
+      res = await handleSponsorCheck(req, env);
     } else {
       res = json({ error: "Not found." }, 404);
     }
