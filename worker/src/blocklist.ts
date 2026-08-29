@@ -33,8 +33,19 @@
 
 import type { Env } from "./config";
 
-/** How long a block lasts without an operator touching it. */
-export const BLOCK_TTL = 30 * 86_400;
+/**
+ * A block does not expire.
+ *
+ * An earlier version lapsed after thirty days, which meant a patient abuser
+ * simply waited — and waiting is free to someone whose attempts cost them
+ * nothing. The only way out is now a person: an admin reviews the complaint and
+ * lifts it.
+ *
+ * That puts real weight on the review path. A permanent block on a shared
+ * carrier address stays wrong until somebody notices, so `listBlocked` is not a
+ * nicety here — it is what stops this becoming a slow leak of customers nobody
+ * can see.
+ */
 
 const blockKey = (ip: string) => `block:ip:${ip}`;
 
@@ -72,7 +83,8 @@ export async function blockIp(
   reason = "repeated false payment claims"
 ): Promise<void> {
   const rec: BlockRecord = { at: Math.floor(Date.now() / 1000), strikes, reason };
-  await env.KV.put(blockKey(ip), JSON.stringify(rec), { expirationTtl: BLOCK_TTL });
+  // No expiry, deliberately — see the note above.
+  await env.KV.put(blockKey(ip), JSON.stringify(rec));
 }
 
 /**

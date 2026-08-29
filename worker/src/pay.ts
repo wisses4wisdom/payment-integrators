@@ -61,10 +61,25 @@ export async function handlePay(req: Request, env: Env, rawLinkId: string): Prom
   // details to is then the key that must sign "I have paid". Two fields could
   // disagree — pointing settlement authority at a key the customer does not
   // hold — and nothing downstream would notice until a real payment was stuck.
+  //
+  // The FORMAT is checked here rather than left to the derivation, because
+  // `publicKeyToAddress` does not validate: it returns a perfectly plausible
+  // address for "0x1234" or for outright garbage. Deriving from a malformed key
+  // would place an order whose recorded customer is an address NOBODY holds the
+  // key for — payable, and then impossible to mark paid. The customer's fiat
+  // would already have left their bank and the order would sit until TTL with
+  // nothing anyone could do. So a bad key must be refused BEFORE an order
+  // exists, not discovered after one does.
+  //
+  // Uncompressed secp256k1: 0x04 followed by 64 bytes of X and Y.
+  const rawKey = (pubKey.startsWith("0x") ? pubKey.slice(2) : pubKey).toLowerCase();
+  if (!/^04[0-9a-f]{128}$/.test(rawKey)) {
+    return badRequest("That payment key is not valid. Please reload the page.");
+  }
+
   let customerKey: Address;
   try {
-    const raw = pubKey.startsWith("0x") ? pubKey : `0x${pubKey}`;
-    customerKey = publicKeyToAddress(raw as `0x${string}`);
+    customerKey = publicKeyToAddress(`0x${rawKey}` as `0x${string}`);
   } catch {
     return badRequest("That payment key is not valid. Please reload the page.");
   }
