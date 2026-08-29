@@ -1218,7 +1218,8 @@ describe("CashbackRegistry — audit regressions", function () {
 
   // CRITICAL 1b — the flat path was the unbounded one.
   it("rejects a flat reward above the ceiling", async function () {
-    const max = await reg.MAX_FLAT_AMOUNT();
+    // AUDIT M2: the ceiling is now decimals-aware, so read it per token.
+    const max = await reg.maxFlatAmountFor(await token2.getAddress());
     await expect(newCampaign(alice, alice.address, 0, max + 1n)).to.be.revertedWithCustomError(
       reg,
       "InvalidRate"
@@ -1495,15 +1496,24 @@ describe("CashbackRegistry — PR #62 review regressions", function () {
   });
 
   // F6 (MEDIUM) — budgets are enforced on-chain, not by allowance discipline.
-  it("F6: MAX_BPS is programme-shaped and MAX_FLAT_AMOUNT bounds a 6dp token", async function () {
+  it("F6/M2: MAX_BPS is programme-shaped and the flat ceiling binds a 6dp token", async function () {
     expect(await reg.MAX_BPS()).to.equal(500); // 5%, not 20%
     await expect(campaign(alice, intgA, { bps: 501 })).to.be.revertedWithCustomError(
       reg,
       "InvalidRate"
     );
 
-    const maxFlat = await reg.MAX_FLAT_AMOUNT();
+    // AUDIT M2. The old fixed 1e21 cap was 10^15 USDC for a 6dp token — no
+    // bound at all. The ceiling is now MAX_FLAT_TOKENS whole tokens whatever
+    // the decimals, so for 6dp USDC it is a real 1,000 USDC per order.
+    const maxFlat = await reg.maxFlatAmountFor(await usdc.getAddress());
+    expect(maxFlat).to.equal(U6(1000));
     await expect(campaign(alice, intgA, { flat: maxFlat + 1n })).to.be.revertedWithCustomError(
+      reg,
+      "InvalidRate"
+    );
+    // And the value that the old ceiling waved through is now rejected.
+    await expect(campaign(alice, intgA, { flat: 10n ** 21n })).to.be.revertedWithCustomError(
       reg,
       "InvalidRate"
     );
@@ -1558,7 +1568,12 @@ describe("CashbackRegistry — PR #62 review regressions", function () {
     const now = (await ethers.provider.getBlock("latest"))!.timestamp;
     await campaign(alice, intgA, {
       bps: 500,
-      budget: { ...NB, startTime: now - 100, endTime: now + 1 },
+      // A real window. AUDIT N4: `endTime: now + 1` used to be accepted, but
+      // the stored start is floored at the creation block — so that was a
+      // zero-length window, a campaign that could never pay any order. The
+      // point of this test is an order placed AFTER a live window, so give it
+      // a window to be after.
+      budget: { ...NB, startTime: now - 100, endTime: now + 1000 },
     });
 
     await orders.setOrderFull(1, buyer.address, U6(1000), COMPLETED, 0, intgA, now + 5000);
@@ -2315,5 +2330,370 @@ describe("CashbackRegistry — fourth-pass regressions", function () {
     ]);
 
     expect(await usdc.balanceOf(buyer.address)).to.equal(U6(1)); // honest row paid
+  });
+});
+
+// ─── Second-pass audit regressions (N1–N9, M1–M4) ────────────────────
+// Self-contained fixture: these must not depend on the helpers above, so a
+// change to another block's setup cannot quietly weaken them.
+
+describe("CashbackRegistry — second-pass audit regressions", function () {
+  const U6 = (n: number | string) => ethers.parseUnits(n.toString(), 6);
+  const ANY_ = ethers.ZeroHash;
+  const BUY_ = ethers.encodeBytes32String("BUY");
+  const INR_ = ethers.encodeBytes32String("INR");
+  const DONE = 3;
+  const NOBUDGET = {
+    maxRewardPerOrder: 0n,
+    dailyBudget: 0n,
+    totalBudget: 0n,
+    dailyPerUser: 0n,
+    startTime: 0n,
+    endTime: 0n,
+  };
+
+  let owner: any, keeper: any, user: any, other: any;
+  let token: any, orders: any, reg: any, integ: string;
+
+  const now = async () => (await ethers.provider.getBlock("latest"))!.timestamp;
+
+  function idFrom(rc: any) {
+    return rc.logs
+      .map((l: any) => {
+        try {
+          return reg.interface.parseLog(l);
+        } catch {
+          return null;
+        }
+      })
+      .find((e: any) => e && e.name === "CampaignCreated").args.campaignId;
+  }
+
+  async function mk(opts: any = {}) {
+    const tx = await reg
+      .connect(opts.as ?? owner)
+      .createCampaign(
+        integ,
+        opts.orderType ?? BUY_,
+        opts.currency ?? INR_,
+        opts.token ?? (await token.getAddress()),
+        opts.bps ?? 100,
+        opts.flat ?? 0n,
+        opts.funder ?? owner.address,
+        { ...NOBUDGET, ...(opts.budget ?? {}) }
+      );
+    const id = idFrom(await tx.wait());
+    if (opts.activate !== false) await reg.connect(opts.as ?? owner).activate(id);
+    return id;
+  }
+
+  beforeEach(async function () {
+    [, keeper, owner, user, other] = await ethers.getSigners();
+    token = await (await ethers.getContractFactory("MockUSDC")).deploy();
+    orders = await (await ethers.getContractFactory("MockOrderSource")).deploy();
+    reg = await (
+      await ethers.getContractFactory("CashbackRegistry")
+    ).deploy(await orders.getAddress());
+    await reg.setAccruer(keeper.address, true);
+    integ = ethers.Wallet.createRandom().address;
+    await reg.setIntegratorOwner(integ, owner.address);
+    await token.mint(owner.address, U6(1000000));
+    await token.connect(owner).approve(await reg.getAddress(), ethers.MaxUint256);
+  });
+
+  // ── N3: an out-of-window campaign must not hold the resolution slot ──
+
+  it("N3: a future-dated campaign no longer shadows the live wildcard beneath it", async function () {
+    await mk({ orderType: ANY_, currency: ANY_, bps: 100 }); // integrator-wide, live
+    const t = await now();
+    await mk({ bps: 300, budget: { startTime: BigInt(t + 7 * 24 * 3600) } }); // starts next week
+
+    await orders.setOrderFull(1, user.address, U6(1000), DONE, 0, integ, t);
+    await reg.connect(keeper).pay(1, integ, user.address, U6(1000));
+
+    // Falls through to the wildcard instead of resolving to a campaign that
+    // cannot pay this order. Previously: nothing was paid at all.
+    expect(await token.balanceOf(user.address)).to.equal(U6(10));
+  });
+
+  it("N3: an expired campaign no longer shadows the live wildcard beneath it", async function () {
+    await mk({ orderType: ANY_, currency: ANY_, bps: 100 });
+    const t = await now();
+    await mk({ bps: 300, budget: { endTime: BigInt(t + 100) } });
+
+    await ethers.provider.send("evm_increaseTime", [500]);
+    await ethers.provider.send("evm_mine", []);
+    const later = await now();
+
+    await orders.setOrderFull(2, user.address, U6(1000), DONE, 0, integ, later);
+    await reg.connect(keeper).pay(2, integ, user.address, U6(1000));
+    expect(await token.balanceOf(user.address)).to.equal(U6(10));
+  });
+
+  it("N3: resolution is judged at the ORDER's time, so a late report still pays", async function () {
+    // Regression guard on the N3 fix. Resolving against `block.timestamp`
+    // would have broken every order reported after its campaign's window
+    // closed — and the watcher holds orders for up to a 14-day dispute TTL.
+    await mk({ orderType: ANY_, currency: ANY_, bps: 100 });
+    const promo = await mk({ bps: 300, budget: { endTime: BigInt((await now()) + 100) } });
+    // Read the clock AFTER activation: the campaign's start is floored at its
+    // own creation block, so an order stamped earlier is legitimately outside
+    // its window and would (correctly) fall through to the wildcard.
+    const t = await now();
+
+    await orders.setOrderFull(3, user.address, U6(1000), DONE, 0, integ, t); // placed in window
+
+    await ethers.provider.send("evm_increaseTime", [5000]); // reported long after
+    await ethers.provider.send("evm_mine", []);
+
+    await expect(reg.connect(keeper).pay(3, integ, user.address, U6(1000)))
+      .to.emit(reg, "Paid")
+      .withArgs(promo, 3, user.address, await token.getAddress(), U6(30));
+    expect(await token.balanceOf(user.address)).to.equal(U6(30)); // 3%, not the 1% wildcard
+  });
+
+  // ── N4: the window is validated against the FLOORED start ──
+
+  it("N4: createCampaign rejects an endTime below the floored start", async function () {
+    await expect(
+      mk({ budget: { startTime: 0n, endTime: 1000n }, activate: false })
+    ).to.be.revertedWithCustomError(reg, "InvalidWindow");
+  });
+
+  it("N4: a legitimately scheduled future window is still accepted", async function () {
+    const t = await now();
+    const id = await mk({
+      budget: { startTime: BigInt(t + 3600), endTime: BigInt(t + 7200) },
+      activate: false,
+    });
+    const c = await reg.getCampaign(id);
+    expect(c.startTime).to.be.lessThan(c.endTime);
+  });
+
+  // ── N5: quote() models the window ──
+
+  it("N5: quote does not advertise a campaign that has not started", async function () {
+    const t = await now();
+    await mk({ bps: 300, budget: { startTime: BigInt(t + 7 * 24 * 3600) } });
+
+    const [, quoted] = await reg.quote(integ, BUY_, INR_, U6(1000));
+    expect(quoted).to.equal(0); // was U6(30) while pay() paid 0
+
+    await orders.setOrderFull(4, user.address, U6(1000), DONE, 0, integ, t);
+    await reg.connect(keeper).pay(4, integ, user.address, U6(1000));
+    expect(await token.balanceOf(user.address)).to.equal(0);
+  });
+
+  it("N5: quote falls through to the campaign that would actually pay", async function () {
+    await mk({ orderType: ANY_, currency: ANY_, bps: 100 });
+    const t = await now();
+    await mk({ bps: 300, budget: { startTime: BigInt(t + 7 * 24 * 3600) } });
+
+    const [, quoted] = await reg.quote(integ, BUY_, INR_, U6(1000));
+    expect(quoted).to.equal(U6(10)); // the wildcard's 1%, which is what pay() pays
+  });
+
+  it("N5/N6: quote reports 0 rather than a partial amount the funder cannot cover", async function () {
+    await token.connect(owner).approve(await reg.getAddress(), U6(1)); // only 1 available
+    await mk({ bps: 100 });
+    const [, quoted] = await reg.quote(integ, BUY_, INR_, U6(1000)); // wants U6(10)
+    expect(quoted).to.equal(0); // pay() would fail on the shortfall, not pay 1
+  });
+
+  // ── N6: budget boundaries defer instead of paying dust ──
+
+  it("N6: an order that does not fit today's budget is deferred, not paid dust", async function () {
+    await mk({ bps: 100, budget: { dailyBudget: U6(10) + 1n } });
+    const t = await now();
+
+    await orders.setOrderFull(5, other.address, U6(1000), DONE, 0, integ, t);
+    await reg.connect(keeper).pay(5, integ, other.address, U6(1000)); // consumes U6(10)
+
+    await orders.setOrderFull(6, user.address, U6(1000), DONE, 0, integ, t);
+    await expect(reg.connect(keeper).pay(6, integ, user.address, U6(1000)))
+      .to.emit(reg, "PayDeclined")
+      .withArgs(6, 10); // BUDGET_EXHAUSTED — retryable
+
+    expect(await token.balanceOf(user.address)).to.equal(0); // not one micro-unit
+    expect(await reg.orderPaid(6)).to.equal(false); // slot NOT burned
+  });
+
+  it("N6: the deferred order pays in full once the daily budget resets", async function () {
+    await mk({ bps: 100, budget: { dailyBudget: U6(10) + 1n } });
+    const t = await now();
+
+    await orders.setOrderFull(7, other.address, U6(1000), DONE, 0, integ, t);
+    await reg.connect(keeper).pay(7, integ, other.address, U6(1000));
+    await orders.setOrderFull(8, user.address, U6(1000), DONE, 0, integ, t);
+    await reg.connect(keeper).pay(8, integ, user.address, U6(1000)); // deferred
+
+    await ethers.provider.send("evm_increaseTime", [2 * 24 * 3600]);
+    await ethers.provider.send("evm_mine", []);
+
+    await reg.connect(keeper).pay(8, integ, user.address, U6(1000));
+    expect(await token.balanceOf(user.address)).to.equal(U6(10)); // in full, a day later
+  });
+
+  it("N6: a reward larger than the whole cap is still paid best-effort, not deadlocked", async function () {
+    // The case that makes a flat all-or-nothing rule wrong: deferring could
+    // never help here, so withholding would be silent non-payment forever.
+    await mk({ bps: 100, budget: { dailyPerUser: U6(1) } }); // cap below one reward
+    const t = await now();
+
+    await orders.setOrderFull(9, user.address, U6(1000), DONE, 0, integ, t);
+    await reg.connect(keeper).pay(9, integ, user.address, U6(1000));
+    expect(await token.balanceOf(user.address)).to.equal(U6(1)); // clamped, not 0
+  });
+
+  // ── F8: the wildcard hole ──
+
+  it("F8: a wildcard campaign does not pay a SELL order", async function () {
+    await mk({ orderType: ANY_, currency: ANY_, bps: 100 });
+    const proxy = ethers.Wallet.createRandom().address;
+    const t = await now();
+
+    await orders.setOrderFull(10, proxy, U6(1000), DONE, 1, integ, t); // 1 = SELL
+    await expect(reg.connect(keeper).pay(10, integ, proxy, U6(1000)))
+      .to.emit(reg, "PayDeclined")
+      .withArgs(10, 3); // ORDER_TYPE — terminal
+    expect(await token.balanceOf(proxy)).to.equal(0);
+  });
+
+  // ── M1: setBudget cannot silently un-bound a campaign ──
+
+  it("M1: setBudget refuses to clear an endTime that is already set", async function () {
+    const t = await now();
+    const id = await mk({ bps: 100, budget: { endTime: BigInt(t + 10000) } });
+
+    await expect(
+      reg.connect(owner).setBudget(id, { ...NOBUDGET, endTime: 0n })
+    ).to.be.revertedWithCustomError(reg, "InvalidWindow");
+
+    const c = await reg.getCampaign(id);
+    expect(c.endTime).to.equal(BigInt(t + 10000)); // still bounded
+  });
+
+  it("M1: the budget event carries every resulting value", async function () {
+    const t = await now();
+    const id = await mk({ bps: 100, budget: { endTime: BigInt(t + 10000) } });
+    const c = await reg.getCampaign(id);
+
+    await expect(
+      reg
+        .connect(owner)
+        .setBudget(id, { ...NOBUDGET, dailyBudget: U6(50), endTime: BigInt(t + 10000) })
+    )
+      .to.emit(reg, "CampaignBudgetChanged")
+      .withArgs(id, 0, U6(50), 0, 0, c.startTime, BigInt(t + 10000));
+  });
+
+  // ── M2: the flat ceiling means the same thing at every precision ──
+
+  it("M2: the flat ceiling is 1,000 whole tokens at 6dp and at 18dp", async function () {
+    const t18 = await (await ethers.getContractFactory("MockToken18")).deploy();
+    expect(await reg.maxFlatAmountFor(await token.getAddress())).to.equal(U6(1000));
+    expect(await reg.maxFlatAmountFor(await t18.getAddress())).to.equal(
+      ethers.parseUnits("1000", 18)
+    );
+  });
+
+  it("M2: a flat reward the old fixed ceiling allowed is now rejected on a 6dp token", async function () {
+    await expect(
+      mk({ bps: 0, flat: 10n ** 21n, activate: false }) // the old MAX_FLAT_AMOUNT
+    ).to.be.revertedWithCustomError(reg, "InvalidRate");
+  });
+
+  it("M2: setRate is bounded by the same ceiling", async function () {
+    const id = await mk({ bps: 100 });
+    await expect(reg.connect(owner).setRate(id, 0, U6(1000) + 1n)).to.be.revertedWithCustomError(
+      reg,
+      "InvalidRate"
+    );
+    await reg.connect(owner).setRate(id, 0, U6(1000)); // at the ceiling: fine
+  });
+
+  // ── N1: declines are legible, and typed terminal vs retryable ──
+
+  it("N1: an order with no campaign is declined terminally", async function () {
+    const t = await now();
+    await orders.setOrderFull(11, user.address, U6(1000), DONE, 0, integ, t);
+    await expect(reg.connect(keeper).pay(11, integ, user.address, U6(1000)))
+      .to.emit(reg, "PayDeclined")
+      .withArgs(11, 4); // NO_CAMPAIGN
+  });
+
+  it("N1: a paused campaign leaves the order unpaid and retryable", async function () {
+    const id = await mk({ bps: 100 });
+    const t = await now();
+    await reg.connect(owner).pause(id);
+
+    await orders.setOrderFull(12, user.address, U6(1000), DONE, 0, integ, t);
+    // Must NOT read as NO_CAMPAIGN (terminal) — a paused campaign resumes,
+    // and retiring the order here is exactly the N1 failure one level down.
+    await expect(reg.connect(keeper).pay(12, integ, user.address, U6(1000)))
+      .to.emit(reg, "PayDeclined")
+      .withArgs(12, 5); // CAMPAIGN_INACTIVE — retryable
+    expect(await reg.orderPaid(12)).to.equal(false);
+
+    // Resuming pays the same order — the property the watcher's retry needs.
+    await reg.connect(owner).activate(id);
+    await reg.connect(keeper).pay(12, integ, user.address, U6(1000));
+    expect(await token.balanceOf(user.address)).to.equal(U6(10));
+  });
+
+  it("N1: a revoked funder declines retryably and the order stays payable", async function () {
+    const treasury = other;
+    await token.mint(treasury.address, U6(100000));
+    await token.connect(treasury).approve(await reg.getAddress(), ethers.MaxUint256);
+    await reg
+      .connect(treasury)
+      .authorizeCampaignFunder(owner.address, await token.getAddress(), true);
+
+    await mk({ bps: 100, funder: treasury.address });
+    const t = await now();
+
+    await reg
+      .connect(treasury)
+      .authorizeCampaignFunder(owner.address, await token.getAddress(), false);
+
+    await orders.setOrderFull(13, user.address, U6(1000), DONE, 0, integ, t);
+    await expect(reg.connect(keeper).pay(13, integ, user.address, U6(1000)))
+      .to.emit(reg, "PayDeclined")
+      .withArgs(13, 8); // FUNDER_UNAUTHORIZED — retryable
+    expect(await reg.orderPaid(13)).to.equal(false);
+
+    await reg
+      .connect(treasury)
+      .authorizeCampaignFunder(owner.address, await token.getAddress(), true);
+    await reg.connect(keeper).pay(13, integ, user.address, U6(1000));
+    expect(await token.balanceOf(user.address)).to.equal(U6(10));
+  });
+
+  it("N1: a second payment attempt on a paid order is declined as ALREADY_PAID", async function () {
+    await mk({ bps: 100 });
+    const t = await now();
+    await orders.setOrderFull(14, user.address, U6(1000), DONE, 0, integ, t);
+    await reg.connect(keeper).pay(14, integ, user.address, U6(1000));
+
+    await expect(reg.connect(keeper).pay(14, integ, user.address, U6(1000)))
+      .to.emit(reg, "PayDeclined")
+      .withArgs(14, 1);
+    expect(await token.balanceOf(user.address)).to.equal(U6(10)); // paid exactly once
+  });
+
+  // ── M3: the view path is gas-capped too ──
+
+  it("M3: a hostile reward token cannot brick quote or campaignView", async function () {
+    const bomb = await (await ethers.getContractFactory("MockBalanceBomb")).deploy();
+    await bomb.mint(owner.address, U6(1000000));
+    await bomb.connect(owner).approve(await reg.getAddress(), ethers.MaxUint256);
+
+    const id = await mk({ token: await bomb.getAddress(), bps: 100 });
+
+    // Both must return rather than revert; an unreadable balance reads as 0.
+    const [, quoted] = await reg.quote(integ, BUY_, INR_, U6(1000));
+    expect(quoted).to.equal(0);
+    const view = await reg.campaignView(id);
+    expect(view.spendable).to.equal(0);
   });
 });

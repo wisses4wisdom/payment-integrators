@@ -13,9 +13,26 @@ import { ethers } from "hardhat";
  *   RATE_BPS           percentage in basis points (100 = 1%)   — XOR FLAT_AMOUNT
  *   FLAT_AMOUNT        fixed reward per order, token units     — XOR RATE_BPS
  *
+ *   MAX_REWARD_PER_ORDER  per-order ceiling, token units. Required unless
+ *                      UNLIMITED=true — see the note below.
+ *
  * Optional env:
- *   ORDER_TYPE         "BUY" | "SELL" | "ANY"   (default BUY)
+ *   ORDER_TYPE         "BUY" | "ANY"            (default BUY)
+ *                      SELL and PAY are rejected by the registry: on offramp
+ *                      flows the order's `user` is a UserProxy, not a person,
+ *                      so the reward is trapped or unattributable. Note a
+ *                      wildcard ("ANY") campaign will not pay them either.
  *   CURRENCY           e.g. "INR", or "ANY"     (default ANY)
+ *   DAILY_BUDGET       max reward units per UTC day       (0 = unlimited)
+ *   TOTAL_BUDGET       lifetime cap in reward units       (0 = unlimited)
+ *   DAILY_PER_USER     max per recipient per UTC day      (0 = unlimited)
+ *   START_TIME         unix seconds; floored at now       (default now)
+ *   END_TIME           unix seconds, 0 = open-ended       (default 0)
+ *   UNLIMITED          "true" to create with NO budget caps at all. This is
+ *                      a deliberate speed bump, not a formality: budgets are
+ *                      the primary spend control, the contract accepts 0 as
+ *                      "unlimited", and a campaign created without them is
+ *                      bounded only by the funding wallet's ERC-20 allowance.
  *   FUNDING_WALLET     wallet paying for THIS campaign (default: your own
  *                      address). Must be you, or a wallet that has approved
  *                      you as a spender of REWARD_TOKEN — proving control.
@@ -27,7 +44,10 @@ import { ethers } from "hardhat";
  *   REGISTRY_ADDRESS=0x… \
  *   INTEGRATOR=0x4aBDf0726cd1B03F43b3d054063b569dFD7772A0 \
  *   REWARD_TOKEN=0x… ORDER_TYPE=BUY CURRENCY=INR RATE_BPS=100 \
+ *   MAX_REWARD_PER_ORDER=5000000 DAILY_BUDGET=500000000 \
  *   npx hardhat run scripts/create-campaign.ts --network baseSepolia
+ *
+ *   (6dp USDC: 5 USDC per order, 500 USDC per day.)
  */
 
 const REGISTRY_ADDRESS = process.env.REGISTRY_ADDRESS || "";
@@ -39,6 +59,13 @@ const ORDER_TYPE = process.env.ORDER_TYPE || "BUY";
 const CURRENCY = process.env.CURRENCY || "ANY";
 const FUNDING_WALLET = process.env.FUNDING_WALLET || "";
 const ACTIVATE = (process.env.ACTIVATE || "").toLowerCase() === "true";
+const MAX_REWARD_PER_ORDER = process.env.MAX_REWARD_PER_ORDER || "0";
+const DAILY_BUDGET = process.env.DAILY_BUDGET || "0";
+const TOTAL_BUDGET = process.env.TOTAL_BUDGET || "0";
+const DAILY_PER_USER = process.env.DAILY_PER_USER || "0";
+const START_TIME = process.env.START_TIME || "0";
+const END_TIME = process.env.END_TIME || "0";
+const UNLIMITED = (process.env.UNLIMITED || "").toLowerCase() === "true";
 
 /** "ANY" maps to bytes32(0), the registry's wildcard. */
 function toBytes32(label: string): string {
@@ -55,6 +82,32 @@ async function main() {
   const flat = BigInt(FLAT_AMOUNT);
   if (bps > 0n === flat > 0n) {
     throw new Error("Set exactly one of RATE_BPS or FLAT_AMOUNT (not both, not neither)");
+  }
+
+  // AUDIT N8/F6. `createCampaign` takes a Budget struct and this script did
+  // not pass one, so it threw on argument count — there was no CLI path to
+  // set the budgets at all, and they are the primary spend control.
+  //
+  // The contract accepts 0 as "unlimited" by design, so the requirement is
+  // enforced here, where an operator is standing up a campaign, rather than
+  // by changing on-chain semantics. Opting out has to be typed out loud.
+  const budget = {
+    maxRewardPerOrder: BigInt(MAX_REWARD_PER_ORDER),
+    dailyBudget: BigInt(DAILY_BUDGET),
+    totalBudget: BigInt(TOTAL_BUDGET),
+    dailyPerUser: BigInt(DAILY_PER_USER),
+    startTime: BigInt(START_TIME),
+    endTime: BigInt(END_TIME),
+  };
+  if (budget.maxRewardPerOrder === 0n && !UNLIMITED) {
+    throw new Error(
+      "MAX_REWARD_PER_ORDER is required (a per-order ceiling in reward-token units).\n" +
+        "  Without it this campaign is bounded only by the funding wallet's allowance.\n" +
+        "  Set UNLIMITED=true to create an uncapped campaign deliberately."
+    );
+  }
+  if (budget.endTime !== 0n && budget.endTime <= BigInt(Math.floor(Date.now() / 1000))) {
+    throw new Error("END_TIME is in the past — the campaign could never pay an order");
   }
 
   const orderType = toBytes32(ORDER_TYPE);
@@ -88,6 +141,26 @@ async function main() {
     bps > 0n ? `${Number(bps) / 100}% (${bps} bps)` : `flat ${flat} token units`
   );
   console.log("Funded by:     ", fundingWallet);
+  console.log(
+    "Per order max: ",
+    budget.maxRewardPerOrder === 0n ? "UNLIMITED" : budget.maxRewardPerOrder.toString()
+  );
+  console.log(
+    "Daily budget:  ",
+    budget.dailyBudget === 0n ? "unlimited" : budget.dailyBudget.toString()
+  );
+  console.log(
+    "Total budget:  ",
+    budget.totalBudget === 0n ? "unlimited" : budget.totalBudget.toString()
+  );
+  console.log(
+    "Per user/day:  ",
+    budget.dailyPerUser === 0n ? "unlimited" : budget.dailyPerUser.toString()
+  );
+  console.log(
+    "Window:        ",
+    `${budget.startTime || "now"} → ${budget.endTime || "open-ended"}`
+  );
   console.log("─────────────────────────────────────────────────────────");
   console.log("");
 
@@ -98,7 +171,8 @@ async function main() {
     REWARD_TOKEN,
     bps,
     flat,
-    fundingWallet
+    fundingWallet,
+    budget
   );
   const receipt = await tx.wait();
 

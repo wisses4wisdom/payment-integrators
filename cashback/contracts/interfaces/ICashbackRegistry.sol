@@ -98,7 +98,19 @@ interface ICashbackRegistry {
         bool allowed
     );
     /// @notice A campaign's budget dials or validity window were changed.
-    event CampaignBudgetChanged(bytes32 indexed campaignId);
+    ///         Carries the complete new budget, because `setBudget` REPLACES
+    ///         the whole struct rather than patching individual dials — an
+    ///         indexer that only saw the id could not tell which caps were
+    ///         dropped by a partial update.
+    event CampaignBudgetChanged(
+        bytes32 indexed campaignId,
+        uint256 maxRewardPerOrder,
+        uint256 dailyBudget,
+        uint256 totalBudget,
+        uint256 dailyPerUser,
+        uint64 startTime,
+        uint64 endTime
+    );
 
     event CampaignCreated(
         bytes32 indexed campaignId,
@@ -136,6 +148,31 @@ interface ICashbackRegistry {
         address indexed user,
         uint256 amount
     );
+
+    /// @notice `pay` declined an order BEFORE attempting any transfer, and
+    ///         said why. `PayFailed` covers the transfer itself; this covers
+    ///         every earlier return-0 path.
+    ///
+    ///         AUDIT N1. This exists for the watcher. `payBatch` swallows
+    ///         per-row outcomes, so a caller could previously not tell "this
+    ///         order will never pay" from "this order could not pay YET"
+    ///         (budget spent for today, funder revoked, campaign paused).
+    ///         The watcher retired both alike and the discovery cursor was
+    ///         long past, so a deferred order was silently never paid.
+    ///         `reason` lets it drop the terminal ones and keep the rest.
+    ///
+    ///         Reasons — see `DECLINE_*` on the registry:
+    ///           1 ALREADY_PAID          terminal
+    ///           2 UNVERIFIED            terminal (order/report mismatch)
+    ///           3 ORDER_TYPE            terminal (SELL/PAY not deliverable)
+    ///           4 NO_CAMPAIGN           terminal
+    ///           5 CAMPAIGN_INACTIVE     retryable (may resume)
+    ///           6 CAMPAIGN_RETIRED      terminal
+    ///           7 OUT_OF_WINDOW         terminal
+    ///           8 FUNDER_UNAUTHORIZED   retryable (may be re-authorised)
+    ///           9 ZERO_REWARD           terminal
+    ///          10 BUDGET_EXHAUSTED      retryable (daily caps reset)
+    event PayDeclined(uint256 indexed orderId, uint8 reason);
 
     event AccruerSet(address indexed accruer, bool allowed);
     event AdminSet(address indexed admin, bool allowed);
