@@ -31,6 +31,58 @@ contract MockOrderSource {
     ///         registry fails closed on an unreachable Diamond.
     bool public reverting;
 
+    /**
+     * @notice The Diamond's own B2B placement event, which is how the watcher
+     *         DISCOVERS orders in the first place.
+     *
+     *         Deliberately not emitted by the `setOrder*` helpers: those write
+     *         a record directly, which is the right shape for a contract test
+     *         that wants an order to exist without a discovery step. The full
+     *         end-to-end run needs the event too, because the watcher's cursor
+     *         is driven by `queryFilter` over it — so it gets its own function
+     *         rather than changing what every existing test emits.
+     */
+    event B2BOrderPlaced(
+        uint256 indexed orderId,
+        address indexed integrator,
+        address indexed user,
+        uint256 amount
+    );
+
+    /**
+     * @notice Record an order as PLACED and announce it, exactly as the
+     *         Diamond does. The end-to-end suite drives the real watcher
+     *         through this, so the discovery leg — `queryFilter`, the block
+     *         cursor, the pending set — is exercised rather than assumed.
+     */
+    function placeB2BOrder(
+        uint256 orderId,
+        address user,
+        uint256 amount,
+        uint8 orderType,
+        bytes32 currency,
+        address integrator
+    ) external {
+        orders[orderId] = Stored({
+            amount: amount,
+            user: user,
+            status: 0, // PLACED — completion is a separate step, as on-chain
+            orderType: orderType,
+            currency: currency,
+            integrator: integrator,
+            placedAt: block.timestamp,
+            exists: true
+        });
+        emit B2BOrderPlaced(orderId, integrator, user, amount);
+    }
+
+    /// @notice Advance an existing order's status, leaving every other field
+    ///         untouched — the completion leg of the flow above.
+    function setStatus(uint256 orderId, uint8 status) external {
+        require(orders[orderId].exists, "unknown order");
+        orders[orderId].status = status;
+    }
+
     /// @notice Convenience overload: BUY, no integrator binding, placed now.
     function setOrder(uint256 orderId, address user, uint256 amount, uint8 status) external {
         orders[orderId] = Stored({

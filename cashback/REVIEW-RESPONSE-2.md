@@ -350,7 +350,9 @@ Corrected.
 
 ## Testing
 
-**119 → 156 tests** (141 registry + 15 end-to-end).
+**119 → 157 tests** (141 registry + 16 end-to-end), plus a full-process
+end-to-end script (`scripts/e2e-full.ts`, 17 checks) that runs the real watcher
+binary against a real chain.
 
 The registry suite gained a second-pass regression block covering every
 finding above, including two adversarial guards: a late-reported order still
@@ -386,7 +388,8 @@ discovery cursor. Those need a live node.
 Run against Node 24.19.0, solc 0.8.28, evm cancun, viaIR:
 
 ```
-156 passing (14s)          0 failing
+157 passing               0 failing
+scripts/e2e-full.ts       17 checks, ALL PASSED (real watcher process)
 CashbackRegistry.sol       92.48% stmts · 82.76% branch · 100% funcs · 97.01% lines
 solhint                    0 errors
 prettier                   clean
@@ -437,6 +440,84 @@ than reading it:
   towards the gate and held total branch coverage at 80.19% against an 80%
   threshold. It was passing by 0.19 points for reasons unrelated to the
   contract being shipped. Scoped to the real contracts, it is 82.76%.
+
+### M6 — holding a declined order turned the loop into a busy-wait
+
+The most serious finding of this pass, and a regression **the N1 fix itself
+introduced**. It was invisible to every test until the watcher was run as a
+process.
+
+The poll loop ended with:
+
+```ts
+if (safeHead < state.lastProcessedBlock + 1 && ready.length === 0) {
+  await sleep(POLL_MS);
+}
+```
+
+That was correct while a declined order was *dropped*: `ready` emptied and the
+loop rested. Once declined orders are **held** and re-reported — which is the
+entire point of N1 — `ready` is never empty while one is deferred, so the loop
+stopped sleeping. It spun as fast as the RPC would answer, sending a `payBatch`
+on every pass.
+
+Measured in `scripts/e2e-full.ts` before the fix: **39 batches and 19 nonce
+collisions in a twenty-second run**, off a single budget-throttled order. On a
+real chain that is the funding wallet's gas burned continuously until the
+14-day TTL expires. The deferral that N1 exists to make safe had become the
+most expensive thing the watcher can do.
+
+Two changes:
+
+- the loop now sleeps unless there is genuine **discovery** backlog to catch up
+  on. Re-reporting the same held rows is not progress;
+- a row the registry declined to settle gets `retryAfter` (`RETRY_BACKOFF_MS`,
+  default 5 minutes) and is not re-reported until it elapses. Every reason a
+  row is held — a daily budget rolling over, a wallet being topped up, a
+  campaign resumed, an approval re-granted — resolves on a human timescale, so
+  retrying every poll buys nothing and costs a transaction each time.
+
+After: **5 batches, 0 nonce collisions**, and the row stays pending throughout
+(12 of 12 samples of the state file).
+
+---
+
+## Full end-to-end — the watcher as a process
+
+`test/cashback-e2e.test.ts` drives the watcher's decision functions with real
+receipts, which is what caught N1. It stops at the RPC boundary, and the file
+said so: `queryFilter`, the block cursor, `tx.wait` and the state file were
+unexercised. Those are not incidental — the cursor **is** the F2 fix, and the
+state file is the only thing that makes a restart safe.
+
+`scripts/e2e-full.ts` closes that gap. It spawns `services/watcher/watcher.ts`
+as a child process, exactly as an operator would, and talks to it only through
+the chain and its own state file. Nothing is stubbed.
+
+```
+npx hardhat node                                     # in another terminal
+npx hardhat run scripts/e2e-full.ts --network localhost
+```
+
+It proves, in order: an order the watcher never saw placed is not paid;
+placement → completion → discovery → payment → retirement; an order that
+completes later is still paid (the F2 pending set); a budget-throttled order is
+held rather than dropped and pays in full the next day, without a batch on
+every poll (N1 + N6); and the state file survives a restart with nothing
+double-paid.
+
+`MockOrderSource` gained the `B2BOrderPlaced` event and a `placeB2BOrder`
+helper for this — the `setOrder*` helpers deliberately still do not emit, so
+existing contract tests are untouched.
+
+**One caveat, recorded because it cost an hour.** The first version of the
+harness spawned the watcher through `npx` with `shell: true`, and on Windows
+`child.kill()` then terminates the wrapper while the ts-node grandchild keeps
+running. Every run leaked a watcher, and they accumulated — several processes
+sharing one state file and one relayer EOA, overwriting each other's pending
+set. The symptom was an order vanishing from the pending set, which looked
+exactly like a product bug and was entirely the harness's fault. It now spawns
+node directly, so the pid it holds is the pid it kills.
 
 Gas measurements are skipped under `solidity-coverage`: instrumentation
 inflates every figure (~98k/row instead of ~66k) and turns the gas-bomb token

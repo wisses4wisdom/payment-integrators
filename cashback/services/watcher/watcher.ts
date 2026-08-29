@@ -108,6 +108,18 @@ const RECHECK_PER_POLL = Number(process.env.RECHECK_PER_POLL || 400);
  */
 const CANCELLED_RECHECK_MS = Number(process.env.CANCELLED_RECHECK_MS || 6 * 60 * 60 * 1000);
 
+/**
+ * How long to wait before RE-REPORTING an order the registry declined to
+ * settle (AUDIT M6).
+ *
+ * Every reason a row is held is one that resolves on a human timescale: a
+ * daily budget rolls over at UTC midnight, a funding wallet gets topped up, a
+ * paused campaign is resumed, an approval is re-granted. Retrying every poll
+ * buys nothing and costs a transaction each time. Five minutes is far below
+ * the shortest of those and far above the poll interval.
+ */
+const RETRY_BACKOFF_MS = Number(process.env.RETRY_BACKOFF_MS || 5 * 60 * 1000);
+
 const STATE_FILE = process.env.STATE_FILE || path.join(__dirname, ".watcher-state.json");
 
 /** Diamond order statuses. */
@@ -164,6 +176,17 @@ export type Pending = {
   // later — so a cancelled order is kept and re-checked slowly rather than
   // dropped. Cleared if it ever leaves CANCELLED.
   cancelledAt?: number;
+  /**
+   * ms epoch before which this order should not be REPORTED again.
+   *
+   * AUDIT M6. Set when a batch comes back without settling the row. Without
+   * it, a deferred order is re-reported on every poll for as long as it is
+   * deferred — up to the full 14-day TTL — which is a transaction every few
+   * seconds for an order the registry has already said it will not pay yet.
+   * The backoff is what makes "hold it and try again" cheap enough to be the
+   * right default.
+   */
+  retryAfter?: number;
 };
 
 type State = {
@@ -199,6 +222,7 @@ function sanitizePending(raw: unknown): Record<string, Pending> {
         firstSeen: p.firstSeen as number,
         lastChecked: typeof p.lastChecked === "number" ? p.lastChecked : 0,
         cancelledAt: typeof p.cancelledAt === "number" ? p.cancelledAt : undefined,
+        retryAfter: typeof p.retryAfter === "number" ? p.retryAfter : undefined,
       };
     } else {
       console.error(`state: dropping unusable pending entry ${key}`);
@@ -471,6 +495,11 @@ async function main() {
           continue;
         }
 
+        // AUDIT M6. The registry already declined this one for a reason that
+        // needs time, not another attempt. Keep it — that is the N1 property —
+        // but do not spend a transaction on it every poll.
+        if (p.retryAfter !== undefined && now < p.retryAfter) continue;
+
         ready.push({
           orderId: BigInt(key),
           integrator: p.integrator,
@@ -529,7 +558,12 @@ async function main() {
 
           for (const r of chunk) {
             const key = r.orderId.toString();
-            if (settled.has(key)) delete state.pending[key];
+            if (settled.has(key)) {
+              delete state.pending[key];
+            } else if (state.pending[key]) {
+              // Held. Back off before asking again (AUDIT M6).
+              state.pending[key].retryAfter = Date.now() + RETRY_BACKOFF_MS;
+            }
           }
 
           const held = chunk.length - settled.size;
@@ -554,7 +588,22 @@ async function main() {
 
       writeState(state);
 
-      if (safeHead < state.lastProcessedBlock + 1 && ready.length === 0) {
+      // Sleep unless there is genuine DISCOVERY backlog to catch up on.
+      //
+      // AUDIT M6 — a regression the N1 fix introduced, found by running the
+      // watcher as a process rather than testing its parts. The condition used
+      // to be `&& ready.length === 0`, which was correct while a declined
+      // order was dropped: `ready` emptied and the loop rested. Now that
+      // declined orders are HELD and re-reported, `ready` is never empty while
+      // one is deferred, so the loop stopped sleeping entirely — spinning as
+      // fast as the RPC allowed and sending a payBatch every pass.
+      //
+      // Measured in the e2e before the fix: 39 batches and 19 nonce collisions
+      // in a twenty-second run, off a single budget-throttled order. On a real
+      // chain that is the funding wallet's gas burned continuously until the
+      // 14-day TTL expires — the deferral that N1 exists to make safe turned
+      // into the most expensive thing the watcher can do.
+      if (safeHead < state.lastProcessedBlock + 1) {
         await sleep(POLL_MS);
       }
     } catch (err) {

@@ -342,6 +342,58 @@ describe("E2E — registry + watcher lifecycle", function () {
     expect(pickedLater.length).to.equal(7);
   });
 
+  // ── M6: holding a declined order must stay cheap ──
+
+  it("M6: a held order keeps its place but is not re-reported every poll", async function () {
+    // Found by running the watcher as a process, not by testing its parts.
+    // Holding a declined order (N1) meant `ready` was never empty while one was
+    // deferred — and the loop only slept when `ready` WAS empty, so it stopped
+    // sleeping and sent a payBatch every iteration. Measured in the full e2e
+    // before the fix: 39 batches and 19 nonce collisions in twenty seconds, off
+    // a single budget-throttled order. On a real chain that is the funding
+    // wallet's gas burned continuously until the 14-day TTL.
+    //
+    // The row must stay pending — that is the whole N1 property — while not
+    // costing a transaction on every pass.
+    await campaign({ bps: 100, budget: { dailyBudget: U6(10) + 1n } });
+    const t = await now();
+
+    const pending: Record<string, Pending> = {
+      "1": pendingRow(alice.address, U6(1000), Date.now()),
+      "2": pendingRow(bob.address, U6(1000), Date.now()),
+    };
+    await orders.setOrderFull(1, alice.address, U6(1000), COMPLETED, 0, integ, t);
+    await orders.setOrderFull(2, bob.address, U6(1000), COMPLETED, 0, integ, t);
+
+    const first = await reportBatch(pending, [1, 2]);
+    expect(first.held, "bob's order does not fit today's budget").to.equal(1);
+    expect(pending["2"], "and is kept").to.not.equal(undefined);
+
+    // The report step stamps a backoff on whatever it could not settle.
+    pending["2"].retryAfter = Date.now() + 5 * 60_000;
+
+    // The next few polls must skip it rather than spend a transaction.
+    const soon = Date.now();
+    expect(
+      selectForRecheck(pending, soon, 10).includes("2"),
+      "still rotated for a STATUS re-check, which is only an RPC read"
+    ).to.equal(true);
+
+    // What must not happen is another payBatch. That is gated on retryAfter in
+    // the report step, so assert the field the watcher reads.
+    expect(pending["2"].retryAfter).to.be.greaterThan(soon);
+
+    // Once the backoff elapses it is reportable again, and the daily budget
+    // having reset is what finally pays it.
+    pending["2"].retryAfter = Date.now() - 1;
+    await ethers.provider.send("evm_increaseTime", [2 * 24 * 3600]);
+    await ethers.provider.send("evm_mine", []);
+
+    const second = await reportBatch(pending, [2]);
+    expect(second.paidCount).to.equal(1);
+    expect(await token.balanceOf(bob.address)).to.equal(U6(10));
+  });
+
   // ── The classification itself ──
 
   it("every retryable decline reason is excluded from the terminal set", async function () {

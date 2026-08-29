@@ -35,3 +35,6 @@ secrets.json
 
 # Claude Code — commit shared config (settings.json, skills/), ignore local overrides
 .claude/settings.local.json
+
+# Local artifact of scripts/e2e-full.ts
+scripts/.e2e-watcher-state.json
