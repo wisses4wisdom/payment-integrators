@@ -8,6 +8,12 @@ compatibility_flags = ["nodejs_compat"]
 #   LINK_KEY_MASTER          32 random bytes, base64. Wraps per-link keys.
 #   WEBHOOK_SIGNING_KEY      HMAC key for outbound webhook signatures
 #   SPONSOR_VERIFIER_SECRET  shared with the sponsorship provider
+#   ADMIN_SECRET             operator access to the blocklist endpoints.
+#                            Fails CLOSED when unset: the route answers 404
+#                            rather than running open. Turnstile fails OPEN,
+#                            which is right for a spam control and wrong here —
+#                            an unset value must not leave fraud blocks
+#                            editable by anyone.
 #   TURNSTILE_SECRET         the human-cost gate
 #
 #   RELAYER_PRIVATE_KEY      DEPRECATED. Delete once link traffic is fully

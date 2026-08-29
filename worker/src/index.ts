@@ -18,6 +18,7 @@ import { handleRegisterWebhook, scanAndQueue, deliverQueued, sweepFalseClaims } 
 import { json, corsHeaders } from "./http";
 import { turnstileEnabled } from "./turnstile";
 import { handleSponsorCheck } from "./sponsor";
+import { handleAdmin } from "./admin";
 
 export { LinkLock, NonceManager, GasBudget } from "./durable";
 
@@ -41,6 +42,10 @@ export default {
       res = await handleRelayTx(req, env);
     } else if (req.method === "POST" && path === "/api/links") {
       res = await handleRegisterWebhook(req, env);
+    } else if (path === "/api/admin/blocks") {
+      // Operator only. Guarded by a shared secret that fails CLOSED — an unset
+      // variable must not leave the blocklist editable by anyone.
+      res = await handleAdmin(req, env);
     } else if (req.method === "POST" && path === "/api/sponsor-check") {
       // Called by the sponsorship provider, not by users. This is where the
       // per-link ceiling lives — the built-in rules are global only, so it is

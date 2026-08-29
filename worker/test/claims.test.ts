@@ -59,10 +59,10 @@ describe("false payment claims", () => {
     expect(await blockedForFalseClaims(env, IP)).toBeNull();
     const warning = await falseClaimWarning(env, IP);
     expect(warning).toMatch(/never received/i);
-    expect(warning).toMatch(/1 more time/i);
+    expect(warning).toMatch(new RegExp(`${MAX_FALSE_CLAIMS - 1} more time`, "i"));
   });
 
-  it("blocks after the second, and says so in words a person can act on", async () => {
+  it("blocks once the allowance is used up, in words a person can act on", async () => {
     for (let i = 1n; i <= BigInt(MAX_FALSE_CLAIMS); i++) {
       await rememberMarkPaid(env, i, IP);
       await recordFalseClaim(env, i);
@@ -76,10 +76,12 @@ describe("false payment claims", () => {
   });
 
   it("charges the claimant, not the merchant and not a bystander", async () => {
-    await rememberMarkPaid(env, 42n, IP);
-    await recordFalseClaim(env, 42n);
-    await rememberMarkPaid(env, 43n, IP);
-    await recordFalseClaim(env, 43n);
+    // Driven off MAX_FALSE_CLAIMS: this test is about WHO is charged, not about
+    // where the threshold sits, so it should not fail when that moves.
+    for (let i = 0; i < MAX_FALSE_CLAIMS; i++) {
+      await rememberMarkPaid(env, BigInt(42 + i), IP);
+      await recordFalseClaim(env, BigInt(42 + i));
+    }
 
     expect(await blockedForFalseClaims(env, IP)).toBeTruthy();
     // Someone else on the same link is unaffected — this is the whole reason

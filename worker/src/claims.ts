@@ -13,8 +13,10 @@
  * surface than the one it closes.
  *
  * Blocking therefore happens HERE, against the claimant, because only this
- * service can see who is asking. One bad claim earns a warning; the second
- * stops them.
+ * service can see who is asking. Each bad claim earns a warning; the third
+ * stops them, at BOTH endpoints — a blocked claimant cannot place an order
+ * either, or they would keep consuming merchants' daily allowance while merely
+ * being unable to finish.
  *
  * An IP is a weak identifier and this is deliberately not presented as a
  * security control — it is friction, sized to the harm. The real guarantee is
@@ -22,11 +24,12 @@
  */
 
 import type { Env } from "./config";
+import { blockIp, blockRecord } from "./blocklist";
 
 const STRIKE_TTL = 86_400; // a day's memory, then a clean slate
 const MARK_TTL = 172_800; // long enough for the scheduled run to see the outcome
 
-export const MAX_FALSE_CLAIMS = 2;
+export const MAX_FALSE_CLAIMS = 3;
 
 const strikeKey = (ip: string) => `claim:strikes:${ip}`;
 const markKey = (orderId: bigint) => `claim:mark:${orderId}`;
@@ -37,10 +40,25 @@ const markKey = (orderId: bigint) => `claim:mark:${orderId}`;
  * warning at claim time by `falseClaimWarning`.
  */
 export async function blockedForFalseClaims(env: Env, ip: string): Promise<string | null> {
+  // The durable block outlives the strike counter, so waiting a day does not
+  // clear it. An operator can lift it — see `unblockIp`.
+  if (await blockRecord(env, ip)) return BLOCKED_MESSAGE;
+
   const n = Number((await env.KV.get(strikeKey(ip))) ?? "0");
   if (n < MAX_FALSE_CLAIMS) return null;
-  return "We could not confirm your previous payments, so this link cannot be marked paid from here. Please contact the merchant.";
+  return BLOCKED_MESSAGE;
 }
+
+/**
+ * Deliberately vague, and pointed at a human.
+ *
+ * It does not say "you are blocked", how many strikes, or how long — telling an
+ * abuser exactly what tripped the rule is telling them exactly what to avoid.
+ * It names the merchant as the route out, because a wrongly-blocked customer
+ * needs a person, not a retry.
+ */
+const BLOCKED_MESSAGE =
+  "We could not confirm your previous payments, so this payment cannot be completed from here. Please contact the merchant.";
 
 /** A warning to show alongside a successful claim, or null. */
 export async function falseClaimWarning(env: Env, ip: string): Promise<string | null> {
@@ -75,6 +93,13 @@ export async function recordFalseClaim(env: Env, orderId: bigint): Promise<strin
   const n = Number((await env.KV.get(strikeKey(ip))) ?? "0") + 1;
   await env.KV.put(strikeKey(ip), String(n), { expirationTtl: STRIKE_TTL });
   await env.KV.delete(markKey(orderId));
+
+  // At the limit, write a durable block. The strike counter alone forgets after
+  // a day, which means a patient abuser simply waits — and a day is a cheap
+  // wait for someone whose attempts cost them nothing.
+  if (n >= MAX_FALSE_CLAIMS) {
+    await blockIp(env, ip, n);
+  }
   return ip;
 }
 

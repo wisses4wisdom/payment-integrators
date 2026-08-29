@@ -30,6 +30,7 @@ import { publicKeyToAddress } from "viem/utils";
 import { json, badRequest, clientIp, isHex32, normalizeLinkId } from "./http";
 import { verifyTurnstile, turnstileTokenFrom } from "./turnstile";
 import { mintClaimToken, storeClaim } from "./orderClaim";
+import { blockedForFalseClaims } from "./claims";
 
 interface PayBody {
   /** Units to buy. Ignored for a fixed-amount link, which pins its own total. */
@@ -79,6 +80,16 @@ export async function handlePay(req: Request, env: Env, rawLinkId: string): Prom
   const ip = clientIp(req);
   const human = await verifyTurnstile(env, turnstileTokenFrom(req, body), ip);
   if (!human.ok) return json({ error: human.message }, 403);
+
+  // Someone already blocked for false claims does not get to place either.
+  //
+  // Blocking only mark-paid left them free to keep opening orders: each one
+  // still consumed a merchant's daily allowance and held a link's use for the
+  // order's lifetime, they just could not finish. Same cost to the merchant,
+  // none to them. The check is per-ADDRESS, not per-profile, so a fresh profile
+  // from the same device changes nothing.
+  const banned = await blockedForFalseClaims(env, ip);
+  if (banned) return json({ error: banned }, 403);
 
   const limited = await checkRateLimits(env, linkId, ip);
   if (limited) return json({ error: limited }, 429);
