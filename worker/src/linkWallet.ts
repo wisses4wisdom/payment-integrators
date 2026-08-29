@@ -63,13 +63,9 @@ const unb64 = (s: string) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
  * the master needs no bulk re-encryption because links expire on their own.
  */
 async function wrappingKey(env: Env, linkId: string): Promise<CryptoKey> {
-  const master = await crypto.subtle.importKey(
-    "raw",
-    unb64(env.LINK_KEY_MASTER),
-    "HKDF",
-    false,
-    ["deriveKey"]
-  );
+  const master = await crypto.subtle.importKey("raw", unb64(env.LINK_KEY_MASTER), "HKDF", false, [
+    "deriveKey",
+  ]);
   return crypto.subtle.deriveKey(
     {
       name: "HKDF",

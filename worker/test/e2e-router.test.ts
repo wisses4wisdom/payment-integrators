@@ -58,7 +58,6 @@ const INR = toHex("INR", { size: 32 }) as Hex;
 const PK = "04" + "ab".repeat(64);
 const CONFIG = "0x636667" as Hex; // "cfg"
 
-
 /**
  * Merchant-side calls.
  *
@@ -106,8 +105,7 @@ d("payment links without a relayer wallet — worker, end to end", () => {
   let customer: ReturnType<typeof privateKeyToAccount>;
   let LINK: Hex;
 
-  const linkIdFor = (salt: string) =>
-    keccak256(toBytes(`${A.merchant}:${salt}`)) as Hex;
+  const linkIdFor = (salt: string) => keccak256(toBytes(`${A.merchant}:${salt}`)) as Hex;
 
   function fakeEnv(): Env {
     store = new Map<string, string>();
@@ -299,20 +297,22 @@ d("payment links without a relayer wallet — worker, end to end", () => {
       chain,
       transport: http(A.rpcUrl),
     });
-    await pub.waitForTransactionReceipt({ hash: await lp.writeContract({
-      address: A.diamond as Address,
-      abi: [
-        {
-          type: "function",
-          name: "simulateOrderAccepted",
-          stateMutability: "nonpayable",
-          inputs: [{ type: "uint256" }],
-          outputs: [],
-        },
-      ] as const,
-      functionName: "simulateOrderAccepted",
-      args: [orderId],
-    }) });
+    await pub.waitForTransactionReceipt({
+      hash: await lp.writeContract({
+        address: A.diamond as Address,
+        abi: [
+          {
+            type: "function",
+            name: "simulateOrderAccepted",
+            stateMutability: "nonpayable",
+            inputs: [{ type: "uint256" }],
+            outputs: [],
+          },
+        ] as const,
+        functionName: "simulateOrderAccepted",
+        args: [orderId],
+      }),
+    });
 
     const before = (await pub.readContract({
       address: A.integrator as Address,
@@ -325,28 +325,30 @@ d("payment links without a relayer wallet — worker, end to end", () => {
     expect(r.error).toBeUndefined();
     expect(r.ok).toBe(true);
 
-    await pub.waitForTransactionReceipt({ hash: await lp.writeContract({
-      address: A.diamond as Address,
-      abi: [
-        {
-          type: "function",
-          name: "simulateOrderComplete",
-          stateMutability: "nonpayable",
-          inputs: [{ type: "uint256" }],
-          outputs: [],
-        },
-      ] as const,
-      functionName: "simulateOrderComplete",
-      args: [orderId],
-      // An EXPLICIT limit, because estimation cannot be trusted here: MockDiamond
-      // CATCHES a failing onOrderComplete, so `eth_estimateGas` binary-searches
-      // to the smallest gas that makes the TRANSACTION succeed — which is the
-      // amount where the callback is skipped. The order then reads as completed
-      // while the USDC sits stranded on the proxy and the merchant is never
-      // credited. Estimating gas for any call whose inner failure is swallowed
-      // has this hazard.
-      gas: 3_000_000n,
-    }) });
+    await pub.waitForTransactionReceipt({
+      hash: await lp.writeContract({
+        address: A.diamond as Address,
+        abi: [
+          {
+            type: "function",
+            name: "simulateOrderComplete",
+            stateMutability: "nonpayable",
+            inputs: [{ type: "uint256" }],
+            outputs: [],
+          },
+        ] as const,
+        functionName: "simulateOrderComplete",
+        args: [orderId],
+        // An EXPLICIT limit, because estimation cannot be trusted here: MockDiamond
+        // CATCHES a failing onOrderComplete, so `eth_estimateGas` binary-searches
+        // to the smallest gas that makes the TRANSACTION succeed — which is the
+        // amount where the callback is skipped. The order then reads as completed
+        // while the USDC sits stranded on the proxy and the merchant is never
+        // credited. Estimating gas for any call whose inner failure is swallowed
+        // has this hazard.
+        gas: 3_000_000n,
+      }),
+    });
 
     const after = (await pub.readContract({
       address: A.integrator as Address,

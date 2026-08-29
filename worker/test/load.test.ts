@@ -209,9 +209,7 @@ describe.skipIf(!HAVE)("load · the payment path under concurrency", () => {
     // order that belongs to someone else's link.
     const links = await makeLinks(12);
 
-    const results = await Promise.all(
-      links.flatMap((l) => [attempt(l), attempt(l)]).map((p) => p)
-    );
+    const results = await Promise.all(links.flatMap((l) => [attempt(l), attempt(l)]).map((p) => p));
 
     expect(results.some((r) => r.threw)).toBe(false);
 

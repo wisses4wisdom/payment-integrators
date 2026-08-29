@@ -72,10 +72,7 @@ export interface AdminRequest {
  * answer identically in every case — distinguishing "bad signature" from
  * "insufficient tier" tells an attacker which half to work on.
  */
-export async function verifyAdmin(
-  env: Env,
-  req: AdminRequest
-): Promise<AdminAuth | null> {
+export async function verifyAdmin(env: Env, req: AdminRequest): Promise<AdminAuth | null> {
   const { signer, signature, action, ip, expiry } = req;
   if (!signer || !signature || !action || typeof expiry !== "number") return null;
 

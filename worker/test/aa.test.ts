@@ -2,7 +2,12 @@ import { describe, it, expect } from "vitest";
 import { decodeFunctionData } from "viem";
 import { executeCall, successFromLogs } from "../src/aa";
 import { SIMPLE_ACCOUNT_ABI, LINK_ROUTER_ABI, ENTRYPOINT_ABI, accountFactory } from "../src/config";
-import { encodeFunctionData, encodeEventTopics, encodeAbiParameters, toFunctionSelector } from "viem";
+import {
+  encodeFunctionData,
+  encodeEventTopics,
+  encodeAbiParameters,
+  toFunctionSelector,
+} from "viem";
 
 /**
  * The user-operation client.

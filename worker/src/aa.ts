@@ -21,7 +21,15 @@
  * a refused payment be reported to a customer as accepted.
  */
 
-import { encodeFunctionData, decodeEventLog, concat, pad, toHex, type Address, type Hex } from "viem";
+import {
+  encodeFunctionData,
+  decodeEventLog,
+  concat,
+  pad,
+  toHex,
+  type Address,
+  type Hex,
+} from "viem";
 import { publicClientFor } from "./chain";
 import { ENTRYPOINT_ABI, SIMPLE_ACCOUNT_ABI, accountFactory, type Env } from "./config";
 
@@ -57,14 +65,20 @@ export class UserOpError extends Error {
 
 const hex = (n: bigint | number): Hex => `0x${BigInt(n).toString(16)}` as Hex;
 
-async function rpc<T>(url: string, method: string, params: unknown[], headers: Record<string, string> = {}): Promise<T> {
+async function rpc<T>(
+  url: string,
+  method: string,
+  params: unknown[],
+  headers: Record<string, string> = {}
+): Promise<T> {
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
   });
   const body = (await res.json()) as { result?: T; error?: { message?: string } };
-  if (body.error) throw new UserOpError(body.error.message ?? method + " failed", "send", body.error);
+  if (body.error)
+    throw new UserOpError(body.error.message ?? method + " failed", "send", body.error);
   return body.result as T;
 }
 
@@ -124,7 +138,12 @@ async function sponsor(env: Env, op: UserOp): Promise<UserOp> {
     }>(
       env.PAYMASTER_URL,
       "pm_getPaymasterData",
-      [op, env.ENTRYPOINT_ADDRESS, hex(Number(env.CHAIN_ID)), { policyId: env.PAYMASTER_POLICY_ID }],
+      [
+        op,
+        env.ENTRYPOINT_ADDRESS,
+        hex(Number(env.CHAIN_ID)),
+        { policyId: env.PAYMASTER_POLICY_ID },
+      ],
       bundlerHeaders(env)
     );
     return {

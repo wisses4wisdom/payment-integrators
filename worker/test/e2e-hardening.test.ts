@@ -76,7 +76,14 @@ const MERCHANT_ABI = [
     ],
   },
 ] as const;
-import { makeTestEnv, type Addresses, useLocalBundler, registerLinkAgent, CUSTOMER_PUBKEY, signRelayAction } from "./harness";
+import {
+  makeTestEnv,
+  type Addresses,
+  useLocalBundler,
+  registerLinkAgent,
+  CUSTOMER_PUBKEY,
+  signRelayAction,
+} from "./harness";
 
 /**
  * Adversarial end-to-end.
@@ -381,7 +388,12 @@ describe.skipIf(!HAS_E2E_FIXTURE)("HARDEN · a link payment actually completes",
     // 2. Customer taps "I have paid" — THE step that was impossible before.
     await acceptOrder(orderId!);
     const relayRes = await handleRelayTx(
-      await relayRequest(orderCall(PAID_SELECTOR, orderId!), "198.51.100.1", addresses.diamond, claim),
+      await relayRequest(
+        orderCall(PAID_SELECTOR, orderId!),
+        "198.51.100.1",
+        addresses.diamond,
+        claim
+      ),
       env
     );
     const relayBody = (await relayRes.json()) as { hash?: string; error?: string };
@@ -453,7 +465,12 @@ describe.skipIf(!HAS_E2E_FIXTURE)("HARDEN · a link payment actually completes",
     expect((await readLink(linkId))[6]).toBe(1); // uses
 
     const res = await handleRelayTx(
-      await relayRequest(orderCall(CANCEL_SELECTOR, orderId!), "198.51.100.1", addresses.diamond, claim),
+      await relayRequest(
+        orderCall(CANCEL_SELECTOR, orderId!),
+        "198.51.100.1",
+        addresses.diamond,
+        claim
+      ),
       env
     );
     const body = (await res.json()) as { error?: string };
@@ -548,7 +565,12 @@ describe.skipIf(!HAS_E2E_FIXTURE)(
       const linkId = await createLink({ amount: USDC(1) });
       const { orderId, claim } = await pay(linkId);
       const req = async () =>
-        await relayRequest(orderCall(PAID_SELECTOR, orderId!), "198.51.100.1", addresses.diamond, claim);
+        await relayRequest(
+          orderCall(PAID_SELECTOR, orderId!),
+          "198.51.100.1",
+          addresses.diamond,
+          claim
+        );
 
       await acceptOrder(orderId!);
       expect((await handleRelayTx(await req(), env)).status).toBe(200);

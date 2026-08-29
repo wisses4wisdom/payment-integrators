@@ -297,7 +297,6 @@ async function registeredCurrency(client: PublicClient, env: Env, merchant: Addr
   }
 }
 
-
 /**
  * Turns a contract revert into something a customer can act on.
  *

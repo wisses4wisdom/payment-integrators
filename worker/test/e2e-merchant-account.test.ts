@@ -16,12 +16,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { handlePay } from "../src/pay";
 import { createLinkWallet } from "../src/linkWallet";
 import { predictAccount, sendUserOp, waitForUserOp, executeCall } from "../src/aa";
-import {
-  makeTestEnv,
-  useLocalBundler,
-  CUSTOMER_PUBKEY,
-  type Addresses,
-} from "./harness";
+import { makeTestEnv, useLocalBundler, CUSTOMER_PUBKEY, type Addresses } from "./harness";
 import { LINK_ROUTER_ABI, ACCOUNT_FACTORY_ABI, type Env } from "../src/config";
 
 /**
@@ -147,9 +142,7 @@ describe.skipIf(!HAVE)("the merchant as a smart account, as in production", () =
     bundlerHandle = useLocalBundler(A);
 
     // A fresh owner key, so this merchant is nobody the other suites touched.
-    merchantKey = privateKeyToAccount(
-      keccak256(toHex(`${RUN}:merchant-owner`)) as Hex
-    );
+    merchantKey = privateKeyToAccount(keccak256(toHex(`${RUN}:merchant-owner`)) as Hex);
     merchantAccount = await predictAccount(env, merchantKey.address);
 
     // Register as a merchant FROM THE SMART ACCOUNT, which also deploys it.
@@ -192,9 +185,7 @@ describe.skipIf(!HAVE)("the merchant as a smart account, as in production", () =
 
   /** `createLink` and `registerAgent` in ONE operation — the production shape. */
   async function createLinkBatched(id: Hex, maxUses = 3) {
-    const account = await createLinkWallet(env, id, 3600, (owner) =>
-      predictAccount(env, owner)
-    );
+    const account = await createLinkWallet(env, id, 3600, (owner) => predictAccount(env, owner));
 
     const outcome = await runOp(
       encodeFunctionData({

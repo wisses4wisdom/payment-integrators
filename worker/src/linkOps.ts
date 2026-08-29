@@ -114,12 +114,18 @@ async function drive(env: Env, linkId: string, routerCall: Hex): Promise<OpResul
       // or a policy that does not cover this call. It must not read as an
       // outage, and it must not be retried into the ground.
       if (e.stage === "sponsor") {
-        return { ok: false, error: "This link has reached its limit. Ask the merchant for a new one." };
+        return {
+          ok: false,
+          error: "This link has reached its limit. Ask the merchant for a new one.",
+        };
       }
       if (e.stage === "receipt") {
         // The operation may still land. Telling the customer to retry risks a
         // second order for the same purchase.
-        return { ok: false, error: "This is taking longer than usual. Your payment is still being confirmed." };
+        return {
+          ok: false,
+          error: "This is taking longer than usual. Your payment is still being confirmed.",
+        };
       }
     }
     return { ok: false, error: "The payment could not be started. Please try again." };
@@ -246,7 +252,11 @@ async function driveAndReadOrder(env: Env, linkId: string, call: Hex): Promise<O
     // The payment DID happen — refusing to invent an id is not the same as
     // saying it failed, and telling the customer to retry would risk a second
     // order for the same purchase.
-    return { ...r, ok: false, error: "The payment could not be confirmed. Please contact support." };
+    return {
+      ...r,
+      ok: false,
+      error: "The payment could not be confirmed. Please contact support.",
+    };
   }
   return { ...r, orderId };
 }

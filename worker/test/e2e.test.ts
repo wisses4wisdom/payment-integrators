@@ -40,7 +40,15 @@ import { handlePay } from "../src/pay";
 import { handleRelayTx } from "../src/relayTx";
 import { INTEGRATOR_ABI, type Env } from "../src/config";
 import { readLink, linkBlockedReason } from "../src/chain";
-import { makeTestEnv, mineBlocks, increaseTime, useLocalBundler, registerLinkAgent, CUSTOMER_PUBKEY, signRelayAction } from "./harness";
+import {
+  makeTestEnv,
+  mineBlocks,
+  increaseTime,
+  useLocalBundler,
+  registerLinkAgent,
+  CUSTOMER_PUBKEY,
+  signRelayAction,
+} from "./harness";
 
 /**
  * End-to-end against a real chain.

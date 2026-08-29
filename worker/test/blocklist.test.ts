@@ -376,7 +376,12 @@ describe("the signature itself", () => {
 
   it("refuses one valid for absurdly long", async () => {
     // A signature good for a year is a bearer token wearing a timestamp.
-    const res = await admin(env, OWNER, { action: "unblock", ip: IP }, { expiry: nowSec() + 31_536_000 });
+    const res = await admin(
+      env,
+      OWNER,
+      { action: "unblock", ip: IP },
+      { expiry: nowSec() + 31_536_000 }
+    );
     expect(res.status).toBe(404);
   });
 
@@ -415,9 +420,14 @@ describe("the signature itself", () => {
   it("cannot be replayed against a different integrator", async () => {
     // The domain binds the verifying contract, so a signature from a testnet
     // deployment is not a signature here.
-    const signed = await signAdmin(env, OWNER, { action: "unblock", ip: IP }, {
-      integrator: "0x9999999999999999999999999999999999999999",
-    });
+    const signed = await signAdmin(
+      env,
+      OWNER,
+      { action: "unblock", ip: IP },
+      {
+        integrator: "0x9999999999999999999999999999999999999999",
+      }
+    );
     const res = await handleAdmin(
       new Request("https://w/api/admin/blocks", {
         method: "POST",

@@ -661,7 +661,8 @@ export const ROUTER_ERRORS: Record<string, string> = {
   AgentAlreadySet: "This link is already set up.",
   UnknownOrder: "That order was not created through this link.",
   OrderLinkMismatch: "That order belongs to a different link.",
-  BadCustomerSignature: "We could not verify this came from you. Please reload the page and try again.",
+  BadCustomerSignature:
+    "We could not verify this came from you. Please reload the page and try again.",
   ZeroAddress: "Invalid address.",
   Reentrancy: "Please try again.",
 };

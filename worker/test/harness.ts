@@ -308,9 +308,7 @@ export async function registerLinkAgent(
   merchantWallet: any,
   routerAddress: string
 ): Promise<string> {
-  const account = await createLinkWallet(env, linkId, 3600, (owner) =>
-    predictAccount(env, owner)
-  );
+  const account = await createLinkWallet(env, linkId, 3600, (owner) => predictAccount(env, owner));
   await merchantWallet.writeContract({
     address: routerAddress as `0x${string}`,
     abi: LINK_ROUTER_ABI,
