@@ -37,9 +37,17 @@ interface StoredKey {
   iv: string;
   /** Ciphertext of the private key, base64. */
   ct: string;
-  /** The wallet address, kept in clear: it is public on-chain anyway, and
-   *  having it avoids an unwrap just to answer "which address is this link". */
-  addr: Address;
+  /** The OWNER of the account — the key we wrapped above. */
+  owner: Address;
+  /** The ACCOUNT address, which is what the Router is told about and what
+   *  appears on-chain as the caller. This is NOT the owner: the owner is an
+   *  ordinary key that could never have its gas sponsored, whereas the account
+   *  is the smart account that key controls. Registering the owner by mistake
+   *  produces a link that looks correctly configured and can never be paid.
+   *
+   *  Kept in clear: both are public on-chain anyway, and having them avoids an
+   *  unwrap just to answer "which address is this link". */
+  account: Address;
 }
 
 const keyName = (linkId: string) => `linkkey:${linkId.toLowerCase()}`;
@@ -82,15 +90,22 @@ async function wrappingKey(env: Env, linkId: string): Promise<CryptoKey> {
  * @param ttlSeconds How long the record lives. Callers pass the link's own
  *        expiry, capped — see `keyTtlFor`. The record evicting itself is what
  *        makes the wallet inert without any cleanup transaction.
- * @returns The wallet address, which the merchant registers on the Router.
+ * @param resolveAccount Turns the generated owner key into the SMART ACCOUNT
+ *        address that key controls. Injected rather than imported so this module
+ *        stays free of chain access and testable without one; production passes
+ *        `predictAccount` from `aa.ts`, which reads it from the factory.
+ * @returns The ACCOUNT address — what the merchant registers on the Router, and
+ *        what appears on-chain as the caller. Not the owner key's own address.
  */
 export async function createLinkWallet(
   env: Env,
   linkId: string,
-  ttlSeconds: number
+  ttlSeconds: number,
+  resolveAccount: (owner: Address) => Promise<Address>
 ): Promise<Address> {
   const pk = generatePrivateKey();
   const account = privateKeyToAccount(pk);
+  const accountAddress = await resolveAccount(account.address);
 
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ct = await crypto.subtle.encrypt(
@@ -99,9 +114,15 @@ export async function createLinkWallet(
     new TextEncoder().encode(pk)
   );
 
-  const rec: StoredKey = { v: 1, iv: b64(iv.buffer), ct: b64(ct), addr: account.address };
+  const rec: StoredKey = {
+    v: 1,
+    iv: b64(iv.buffer),
+    ct: b64(ct),
+    owner: account.address,
+    account: accountAddress,
+  };
   await env.KV.put(keyName(linkId), JSON.stringify(rec), { expirationTtl: ttlSeconds });
-  return account.address;
+  return accountAddress;
 }
 
 /**
@@ -138,12 +159,25 @@ export async function linkSigner(env: Env, linkId: string) {
   }
 }
 
-/** The wallet address for a link, without unwrapping the key. */
+/** The ACCOUNT address for a link — the on-chain caller — without unwrapping
+ *  the key. This is what `registerAgent` was given and what the Router checks. */
 export async function linkWalletAddress(env: Env, linkId: string): Promise<Address | null> {
   const raw = await env.KV.get(keyName(linkId));
   if (!raw) return null;
   try {
-    return (JSON.parse(raw) as StoredKey).addr;
+    return (JSON.parse(raw) as StoredKey).account;
+  } catch {
+    return null;
+  }
+}
+
+/** The OWNER address for a link — the key that signs. Rarely needed; use
+ *  `linkWalletAddress` for anything the chain will compare against. */
+export async function linkOwnerAddress(env: Env, linkId: string): Promise<Address | null> {
+  const raw = await env.KV.get(keyName(linkId));
+  if (!raw) return null;
+  try {
+    return (JSON.parse(raw) as StoredKey).owner;
   } catch {
     return null;
   }

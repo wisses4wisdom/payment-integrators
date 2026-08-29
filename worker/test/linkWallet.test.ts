@@ -4,6 +4,7 @@ import {
   createLinkWallet,
   linkSigner,
   linkWalletAddress,
+  linkOwnerAddress,
   destroyLinkWallet,
   keyTtlFor,
   MAX_KEY_TTL,
@@ -29,6 +30,17 @@ if (!(globalThis as any).crypto) (globalThis as any).crypto = webcrypto;
 
 const MASTER_A = Buffer.from(new Uint8Array(32).fill(7)).toString("base64");
 const MASTER_B = Buffer.from(new Uint8Array(32).fill(9)).toString("base64");
+
+/**
+ * Stands in for the account factory.
+ *
+ * Returns an address that is DIFFERENT from the owner, deliberately: the real
+ * factory does too, and conflating the two produces a link that looks
+ * correctly configured and can never be paid. Several tests below exist only
+ * to pin that distinction.
+ */
+const fakeFactory = async (owner: `0x${string}`): Promise<`0x${string}`> =>
+  ("0xacc0" + owner.slice(6)) as `0x${string}`;
 
 const LINK = "0x" + "ab".repeat(32);
 const LINK2 = "0x" + "cd".repeat(32);
@@ -56,39 +68,56 @@ describe("per-link wallet keys", () => {
   });
 
   it("creates a wallet and can sign with it again later", async () => {
-    const addr = await createLinkWallet(env, LINK, 3600);
+    const account = await createLinkWallet(env, LINK, 3600, fakeFactory);
     const signer = await linkSigner(env, LINK);
     expect(signer).not.toBeNull();
-    expect(signer!.address).toBe(addr);
+    // The signer owns the account; it is not the account. Comparing the two
+    // is the mistake this distinction exists to prevent.
+    expect(signer!.address).toBe(await linkOwnerAddress(env, LINK));
+    expect(account).toBe(await linkWalletAddress(env, LINK));
   });
 
   it("gives every link a different wallet", async () => {
-    const a = await createLinkWallet(env, LINK, 3600);
-    const b = await createLinkWallet(env, LINK2, 3600);
+    const a = await createLinkWallet(env, LINK, 3600, fakeFactory);
+    const b = await createLinkWallet(env, LINK2, 3600, fakeFactory);
     // Scope is exact because the addresses differ. A key leaked from one link
     // is the wrong address for any other, which is what the Router checks.
     expect(a).not.toBe(b);
   });
 
   it("never writes the private key in the clear", async () => {
-    await createLinkWallet(env, LINK, 3600);
+    await createLinkWallet(env, LINK, 3600, fakeFactory);
     const raw = store.get(`linkkey:${LINK}`)!;
     const signer = await linkSigner(env, LINK);
-    // The wrapped record must not contain the key material it protects.
-    expect(raw).not.toContain(signer!.address.slice(2).toLowerCase());
+    // The wrapped record must not contain the key material it protects. The
+    // owner ADDRESS is fine to store — it is public; the private key is not.
+    expect(raw).not.toContain(signer!.privateKey ?? "\u0000never");
     expect(JSON.parse(raw).ct).toBeTruthy();
     expect(JSON.parse(raw).v).toBe(1);
   });
 
-  it("exposes the address without unwrapping the key", async () => {
-    const addr = await createLinkWallet(env, LINK, 3600);
+  it("exposes the ACCOUNT address without unwrapping the key", async () => {
+    const addr = await createLinkWallet(env, LINK, 3600, fakeFactory);
     expect(await linkWalletAddress(env, LINK)).toBe(addr);
+  });
+
+  it("returns the ACCOUNT address, never the owner key's own address", async () => {
+    // The bug this pins: registering the owner instead of the account gives a
+    // link that passes every check we make locally and can never be paid,
+    // because the address that actually calls the Router is the account.
+    const account = await createLinkWallet(env, LINK, 3600, fakeFactory);
+    const owner = await linkOwnerAddress(env, LINK);
+    const signer = await linkSigner(env, LINK);
+
+    expect(owner).toBe(signer!.address);
+    expect(account).not.toBe(owner);
+    expect(account).toBe(await fakeFactory(owner!));
   });
 
   // ─── Neither secret is sufficient alone ────────────────────────────
 
   it("a stolen store is useless without the master secret", async () => {
-    await createLinkWallet(env, LINK, 3600);
+    await createLinkWallet(env, LINK, 3600, fakeFactory);
 
     // Same records, different master. This is an attacker who exfiltrated the
     // key store but not the managed-key credential.
@@ -102,7 +131,7 @@ describe("per-link wallet keys", () => {
     // Keys are never derived deterministically from the link id, precisely so
     // that the master alone is not enough — there is always a second thing to
     // steal.
-    await createLinkWallet(env, LINK, 3600);
+    await createLinkWallet(env, LINK, 3600, fakeFactory);
     const emptyStore = fakeEnv(MASTER_A);
     expect(await linkSigner(emptyStore.env, LINK)).toBeNull();
   });
@@ -110,13 +139,13 @@ describe("per-link wallet keys", () => {
   it("refuses a record wrapped for a different link", async () => {
     // The link id is the HKDF salt, so a record moved between links fails
     // authentication rather than yielding some other link's signer.
-    await createLinkWallet(env, LINK, 3600);
+    await createLinkWallet(env, LINK, 3600, fakeFactory);
     store.set(`linkkey:${LINK2}`, store.get(`linkkey:${LINK}`)!);
     expect(await linkSigner(env, LINK2)).toBeNull();
   });
 
   it("refuses a tampered record rather than returning a junk signer", async () => {
-    await createLinkWallet(env, LINK, 3600);
+    await createLinkWallet(env, LINK, 3600, fakeFactory);
     const rec = JSON.parse(store.get(`linkkey:${LINK}`)!);
     const ct = Buffer.from(rec.ct, "base64");
     ct[0] ^= 0xff;
@@ -135,15 +164,21 @@ describe("per-link wallet keys", () => {
   });
 
   it("destroy makes the wallet immediately undrivable", async () => {
-    await createLinkWallet(env, LINK, 3600);
+    await createLinkWallet(env, LINK, 3600, fakeFactory);
     await destroyLinkWallet(env, LINK);
     expect(await linkSigner(env, LINK)).toBeNull();
   });
 
   it("is case-insensitive about the link id", async () => {
-    const addr = await createLinkWallet(env, LINK.toUpperCase().replace("0X", "0x"), 3600);
+    const account = await createLinkWallet(
+      env,
+      LINK.toUpperCase().replace("0X", "0x"),
+      3600,
+      fakeFactory
+    );
     const signer = await linkSigner(env, LINK);
-    expect(signer!.address).toBe(addr);
+    expect(signer).not.toBeNull();
+    expect(account).toBe(await linkWalletAddress(env, LINK));
   });
 });
 

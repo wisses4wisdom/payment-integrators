@@ -65,6 +65,23 @@ export interface Env {
    *  (`onOrderCancel` does `cl.uses--`), so `maxUses` caps concurrent orders,
    *  not total attempts. Defaults to 20. */
   MAX_SPONSORED_OPS_PER_LINK?: string;
+  /** ERC-4337 EntryPoint. The same singleton already deployed on Base. */
+  ENTRYPOINT_ADDRESS: string;
+  /** Account factory. Addresses are deterministic, so a link's wallet is
+   *  known before it exists and is deployed lazily on the first payment —
+   *  a link nobody ever pays deploys nothing at all. */
+  ACCOUNT_FACTORY_ADDRESS: string;
+  /** Bundler RPC. This is what replaces the funded key AND the nonce
+   *  manager: each link's account has its own nonce sequence, so one stuck
+   *  payment cannot block every later one. */
+  BUNDLER_URL: string;
+  /** Sponsorship RPC. Omit only for local development. Without it nothing is
+   *  sponsored, and an empty link wallet has no way to pay for itself. */
+  PAYMASTER_URL?: string;
+  PAYMASTER_POLICY_ID?: string;
+  /** Bearer token for the bundler and paymaster. Server side only, and
+   *  unrestricted by domain, so it is treated as a high-value credential. */
+  BUNDLER_SECRET?: string;
   /** The checkout client the widget prices against. Pinned, not caller-supplied. */
   CLIENT_ADDRESS: string;
   /** The productId the client prices a single unit at. Defaults to 1. */
@@ -599,3 +616,107 @@ export const ROUTER_ERRORS: Record<string, string> = {
   ZeroAddress: "Invalid address.",
   Reentrancy: "Please try again.",
 };
+
+/**
+ * ERC-4337 EntryPoint (v0.7) — only what the payment path reads.
+ *
+ * `UserOperationEvent.success` is the important one and the easiest to skip.
+ * `handleOps` does not revert when the inner call fails: the EntryPoint catches
+ * it and records the outcome here, so a refused payment and a completed one are
+ * indistinguishable from the outside. Treating a bundler hash as confirmation
+ * would tell a customer their payment went through when the Router rejected it.
+ */
+export const ENTRYPOINT_ABI = [
+  {
+    type: "function",
+    name: "getNonce",
+    stateMutability: "view",
+    inputs: [
+      { name: "sender", type: "address" },
+      { name: "key", type: "uint192" },
+    ],
+    outputs: [{ type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "getUserOpHash",
+    stateMutability: "view",
+    inputs: [
+      {
+        name: "userOp",
+        type: "tuple",
+        components: [
+          { name: "sender", type: "address" },
+          { name: "nonce", type: "uint256" },
+          { name: "initCode", type: "bytes" },
+          { name: "callData", type: "bytes" },
+          { name: "accountGasLimits", type: "bytes32" },
+          { name: "preVerificationGas", type: "uint256" },
+          { name: "gasFees", type: "bytes32" },
+          { name: "paymasterAndData", type: "bytes" },
+          { name: "signature", type: "bytes" },
+        ],
+      },
+    ],
+    outputs: [{ type: "bytes32" }],
+  },
+  {
+    type: "event",
+    name: "UserOperationEvent",
+    inputs: [
+      { name: "userOpHash", type: "bytes32", indexed: true },
+      { name: "sender", type: "address", indexed: true },
+      { name: "paymaster", type: "address", indexed: true },
+      { name: "nonce", type: "uint256", indexed: false },
+      { name: "success", type: "bool", indexed: false },
+      { name: "actualGasCost", type: "uint256", indexed: false },
+      { name: "actualGasUsed", type: "uint256", indexed: false },
+    ],
+  },
+] as const;
+
+/** The account's own entry point. Value is always zero here — the link's
+ *  account holds nothing, and nothing in this flow moves native coin. */
+export const SIMPLE_ACCOUNT_ABI = [
+  {
+    type: "function",
+    name: "execute",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "dest", type: "address" },
+      { name: "value", type: "uint256" },
+      { name: "func", type: "bytes" },
+    ],
+    outputs: [],
+  },
+] as const;
+
+/**
+ * The account factory.
+ *
+ * `getAddress` is a VIEW: the address exists as a computation before any
+ * account is deployed, which is what lets a merchant register a link's wallet
+ * at creation time and lets a link nobody ever pays deploy nothing at all.
+ */
+export const ACCOUNT_FACTORY_ABI = [
+  {
+    type: "function",
+    name: "getAddress",
+    stateMutability: "view",
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "salt", type: "uint256" },
+    ],
+    outputs: [{ type: "address" }],
+  },
+  {
+    type: "function",
+    name: "createAccount",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "salt", type: "uint256" },
+    ],
+    outputs: [{ type: "address" }],
+  },
+] as const;
