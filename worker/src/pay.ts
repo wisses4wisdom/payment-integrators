@@ -3,19 +3,30 @@
  *
  * The whole design in one sentence: the request body supplies a quantity and a
  * relay pubkey, and everything else about the payment is read from the chain.
+ *
+ * WHAT CHANGED WHEN THE RELAYER WALLET WENT AWAY
+ * This endpoint no longer signs anything itself. It validates, then hands the
+ * placement to `linkOps`, which drives the link's OWN account through the
+ * Router. Gone with the funded key: the gas ceilings (the sponsorship policy
+ * decides before the operation reaches the chain, not after money is spent),
+ * the global nonce (each link's account has its own sequence, so one stuck
+ * payment no longer blocks every later one), and the receipt wait (the
+ * operation's own outcome flag is what says the order exists — a bundler hash
+ * is not proof of anything).
  */
 
-import { decodeEventLog, type Address, type Hex, type PublicClient } from "viem";
+import { type Address, type Hex, type PublicClient } from "viem";
 import {
   INTEGRATOR_ABI,
   REVERT_MESSAGES,
   CALL_FAILED_SELECTOR,
-  limitsFor,
   productIdFor,
   type Env,
 } from "./config";
-import { publicClientFor, relayerFor, readLink, linkBlockedReason } from "./chain";
-import { checkRateLimits, reserveGas, releaseGas, gasPriceFor } from "./limits";
+import { publicClientFor, readLink, linkBlockedReason } from "./chain";
+import { checkRateLimits } from "./limits";
+import { placeOrder, simulatePlace } from "./linkOps";
+import { publicKeyToAddress } from "viem/utils";
 import { json, badRequest, clientIp, isHex32, normalizeLinkId } from "./http";
 import { verifyTurnstile, turnstileTokenFrom } from "./turnstile";
 import { mintClaimToken, storeClaim } from "./orderClaim";
@@ -37,11 +48,25 @@ export async function handlePay(req: Request, env: Env, rawLinkId: string): Prom
   const linkId = normalizeLinkId(rawLinkId);
   if (!isHex32(linkId)) return badRequest("That payment link address is not valid.");
 
-  const limits = limitsFor(env);
-
   const body = (await req.json().catch(() => ({}))) as PayBody;
   const pubKey = typeof body.pubKey === "string" ? body.pubKey : "";
   if (!pubKey) return badRequest("Missing payment key. Please reload the page.");
+
+  // The address that will be recorded on-chain as the only key allowed to mark
+  // this order paid or cancel it.
+  //
+  // DERIVED from the key the browser already sends, rather than accepted as a
+  // separate field. That is deliberate: the same key the LP encrypts payment
+  // details to is then the key that must sign "I have paid". Two fields could
+  // disagree — pointing settlement authority at a key the customer does not
+  // hold — and nothing downstream would notice until a real payment was stuck.
+  let customerKey: Address;
+  try {
+    const raw = pubKey.startsWith("0x") ? pubKey : `0x${pubKey}`;
+    customerKey = publicKeyToAddress(raw as `0x${string}`);
+  } catch {
+    return badRequest("That payment key is not valid. Please reload the page.");
+  }
 
   // 1 ── Human-cost gate, then rate limits — both before any RPC call.
   //
@@ -122,109 +147,47 @@ export async function handlePay(req: Request, env: Env, rawLinkId: string): Prom
     }
     const circleId = BigInt(Number(rawCircle));
 
-    const { wallet, address: relayer } = relayerFor(env);
-    const args = [
-      linkId as Hex,
-      env.CLIENT_ADDRESS as Address,
-      productIdFor(env), // pinned by config; never caller-supplied
+    // ─── 5 ── Send it, as the link's OWN account ────────────────────
+    //
+    // What is gone from here, and why:
+    //   • the funded relayer wallet — the sender now holds nothing, so there is
+    //     no balance to drain, monitor or refill;
+    //   • the gas ceilings — the sponsorship policy decides before the
+    //     operation reaches the chain, rather than us metering after the fact;
+    //   • the global nonce — each link's account has its own sequence, so one
+    //     stuck payment can no longer block every later one.
+    //
+    // What replaces the receipt wait is NOT weaker: `placeOrder` waits for the
+    // operation's own outcome flag. A bundler hash is not proof of anything —
+    // the EntryPoint catches a failed inner call and still reports success on
+    // the transaction, so the flag is the only thing that says the order exists.
+    const placeArgs = {
+      client: env.CLIENT_ADDRESS as Address,
+      productId: productIdFor(env), // pinned by config; never caller-supplied
       quantity,
-      link.currency,
+      currency: link.currency,
       circleId,
       pubKey,
-    ] as const;
-
-    // 5 ── Simulate first. A revert here is the contract telling us the payment
-    //      would fail, and costs nothing.
-    let gas: bigint;
-    try {
-      const sim = await client.simulateContract({
-        address: env.INTEGRATOR_ADDRESS as Address,
-        abi: INTEGRATOR_ABI,
-        functionName: "relayerPlaceOrder",
-        args,
-        account: relayer,
-      });
-      gas = await client.estimateContractGas({
-        address: env.INTEGRATOR_ADDRESS as Address,
-        abi: INTEGRATOR_ABI,
-        functionName: "relayerPlaceOrder",
-        args,
-        account: relayer,
-      });
-      void sim;
-    } catch (err) {
-      return json({ error: explainRevert(err) }, 409);
-    }
-
-    // 6 ── Gas ceilings, reserved before sending.
-    const sendGas = (gas * limitsFor(env).gasBufferPct) / 100n;
-    const gasPrice = await gasPriceFor(client);
-    // AUDIT N2. Scoped to this link and merchant as well as globally, so one
-    // hammered link cannot spend the whole service's day.
-    const gasScope = { linkId, merchant: link.owner as string };
-    const capped = await reserveGas(env, sendGas, gasPrice, gasScope);
-    if (capped) return json({ error: capped }, 503);
-
-    // 7 ── One nonce, allocated globally so two links cannot collide.
-    const nonceStub = env.NONCE.get(env.NONCE.idFromName("relayer"));
-    const { nonce } = (await (await nonceStub.fetch("https://nonce/allocate")).json()) as {
-      nonce: number;
+      // Recorded on-chain as the only key that may later mark this order paid
+      // or cancel it. Without it, whoever holds the link key could advance or
+      // cancel a stranger's in-flight payment.
+      customer: customerKey,
     };
 
-    let hash: Hex;
-    try {
-      hash = await wallet.writeContract({
-        address: env.INTEGRATOR_ADDRESS as Address,
-        abi: INTEGRATOR_ABI,
-        functionName: "relayerPlaceOrder",
-        args,
-        account: wallet.account!,
-        chain: wallet.chain,
-        nonce,
-        gas: sendGas,
-      });
-    } catch (err) {
-      // Nothing was broadcast, so give the reservation back — otherwise a run
-      // of RPC failures burns a whole day's budget with no transactions sent.
-      await releaseGas(env, sendGas, gasPrice, gasScope);
-      // A failed send leaves a hole in the sequence — resync rather than
-      // letting every later payment queue behind a nonce that never lands.
-      await nonceStub.fetch("https://nonce/resync");
-      return json({ error: explainRevert(err) }, 502);
+    // Ask the contract first. A revert here is the contract naming the problem
+    // — expired, daily limit, amount mismatch — and the customer can act on
+    // that. Sending anyway would turn all of them into "please try again".
+    const wouldFail = await simulatePlace(env, linkId, placeArgs);
+    if (wouldFail) return json({ error: explainRevert(wouldFail) }, 409);
+
+    const placed = await placeOrder(env, linkId, placeArgs);
+
+    if (!placed.ok || placed.orderId === undefined) {
+      return json({ error: placed.error ?? "The payment could not be started." }, 502);
     }
 
-    // 8 ── Wait for the receipt ourselves. A returned hash is not proof the
-    //      order exists; the log is.
-    //
-    //      A timeout here does NOT mean the payment failed — the transaction
-    //      may still land. Hand the customer the hash so the page can keep
-    //      watching, rather than telling them to retry and risking a second
-    //      order for the same purchase.
-    let receipt;
-    try {
-      receipt = await client.waitForTransactionReceipt({
-        hash,
-        timeout: limits.receiptTimeoutMs,
-      });
-    } catch {
-      return json(
-        {
-          pending: true,
-          txHash: hash,
-          error: "This is taking longer than usual. Your payment is still being confirmed.",
-        },
-        202
-      );
-    }
-
-    if (receipt.status !== "success") {
-      return json({ error: "The payment could not be started. Please try again." }, 502);
-    }
-
-    const orderId = extractOrderId(receipt.logs, env);
-    if (orderId === null) {
-      return json({ error: "The payment could not be confirmed. Please try again." }, 502);
-    }
+    const orderId = placed.orderId;
+    const hash = placed.txHash ?? placed.userOpHash!;
 
     await env.KV.put(
       `order:${orderId}`,
@@ -235,8 +198,7 @@ export async function handlePay(req: Request, env: Env, rawLinkId: string): Prom
     // Bind the order to THIS browser. The orderId is public — indexed in
     // LinkOrderPlaced, sequential on the Diamond, readable from orderToLink — so
     // without a token anyone who sees one can cancel or falsely mark paid a
-    // stranger's in-flight payment through /api/relay-tx, at our gas expense.
-    // Returned once, here, to the browser that caused the placement.
+    // stranger's in-flight payment through /api/relay-tx.
     const claimToken = mintClaimToken();
     await storeClaim(env, orderId, claimToken);
 
@@ -309,28 +271,6 @@ async function registeredCurrency(client: PublicClient, env: Env, merchant: Addr
   }
 }
 
-function extractOrderId(
-  logs: readonly { topics: readonly Hex[]; data: Hex; address: Address }[],
-  env: Env
-): bigint | null {
-  const ours = env.INTEGRATOR_ADDRESS.toLowerCase();
-  for (const log of logs) {
-    if (log.address.toLowerCase() !== ours) continue;
-    try {
-      const ev = decodeEventLog({
-        abi: INTEGRATOR_ABI,
-        data: log.data,
-        topics: log.topics as [Hex, ...Hex[]],
-      });
-      if (ev.eventName === "LinkOrderPlaced") {
-        return (ev.args as unknown as { orderId: bigint }).orderId;
-      }
-    } catch {
-      // Not one of ours — keep looking.
-    }
-  }
-  return null;
-}
 
 /**
  * Turns a contract revert into something a customer can act on.

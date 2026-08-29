@@ -600,6 +600,44 @@ export const LINK_ROUTER_ABI = [
     ],
     outputs: [{ type: "bytes32" }],
   },
+  // Events. `OrderPlaced` carries the customer key the Router recorded, which
+  // is the only address that can later settle or cancel that order — so this is
+  // where a support question about "who is allowed to finish this payment" is
+  // answered, without unwrapping any key.
+  {
+    type: "event",
+    name: "OrderPlaced",
+    inputs: [
+      { name: "linkId", type: "bytes32", indexed: true },
+      { name: "orderId", type: "uint256", indexed: true },
+      { name: "customer", type: "address", indexed: false },
+    ],
+  },
+  {
+    type: "event",
+    name: "OrderMarkedPaid",
+    inputs: [
+      { name: "linkId", type: "bytes32", indexed: true },
+      { name: "orderId", type: "uint256", indexed: true },
+    ],
+  },
+  {
+    type: "event",
+    name: "OrderCancelled",
+    inputs: [
+      { name: "linkId", type: "bytes32", indexed: true },
+      { name: "orderId", type: "uint256", indexed: true },
+    ],
+  },
+  {
+    type: "event",
+    name: "AgentRegistered",
+    inputs: [
+      { name: "linkId", type: "bytes32", indexed: true },
+      { name: "agent", type: "address", indexed: true },
+      { name: "merchant", type: "address", indexed: true },
+    ],
+  },
 ] as const;
 
 /**

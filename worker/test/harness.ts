@@ -10,6 +10,10 @@
 import { createPublicClient, http, defineChain, type Address } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { DEFAULT_LIMITS, type Env } from "../src/config";
+import { ENTRYPOINT_ABI, LINK_ROUTER_ABI } from "../src/config";
+import { createLinkWallet } from "../src/linkWallet";
+import { predictAccount } from "../src/aa";
+import { localBundler } from "./localBundler";
 
 export interface Addresses {
   rpcUrl: string;
@@ -22,6 +26,13 @@ export interface Addresses {
   relayer: string;
   relayerKey: string;
   settlementPeriod: number;
+  // ─── The relayer-free path ───
+  router: string;
+  entryPoint: string;
+  accountFactory: string;
+  paymaster: string;
+  sponsorKey: string;
+  bundlerKey: string;
 }
 
 function memoryKV(): KVNamespace {
@@ -194,6 +205,9 @@ export function makeTestEnv(a: Addresses, overrides: EnvOverrides = {}): Env {
   };
 
   return {
+    // Kept only for the keeper duty (deliverFiatPayout), which is unrelated to
+    // links and predates this feature. Nothing on the payment path uses it any
+    // more: the sender is the link's own account, which holds nothing.
     RELAYER_PRIVATE_KEY: a.relayerKey,
     WEBHOOK_SIGNING_KEY: "test-signing-key",
     RPC_URL: a.rpcUrl,
@@ -202,11 +216,103 @@ export function makeTestEnv(a: Addresses, overrides: EnvOverrides = {}): Env {
     DIAMOND_ADDRESS: a.diamond,
     CLIENT_ADDRESS: a.client,
     ALLOWED_ORIGINS: "",
+
+    // ─── The relayer-free path ───
+    LINK_ROUTER_ADDRESS: a.router,
+    ENTRYPOINT_ADDRESS: a.entryPoint,
+    ACCOUNT_FACTORY_ADDRESS: a.accountFactory,
+    // Only these two differ from production. Everything in `src/` runs
+    // unchanged, so a packing or receipt-reading mistake fails here exactly the
+    // way it would fail live.
+    BUNDLER_URL: "http://local-bundler/rpc",
+    PAYMASTER_URL: "http://local-bundler/rpc",
+    LINK_KEY_MASTER: Buffer.from(new Uint8Array(32).fill(11)).toString("base64"),
+    MAX_SPONSORED_OPS_PER_LINK: "50",
+
     KV: memoryKV(),
     LINK_LOCK: memoryDO((s, p) => lockHandler(s, p), ctx),
     NONCE: memoryDO(nonceHandler, ctx),
     GAS_BUDGET: memoryDO(gasBudgetHandler, ctx),
-  };
+  } as unknown as Env;
+}
+
+/**
+ * Points `fetch` at a local bundler and paymaster for the duration of a suite.
+ *
+ * The worker talks to them over the same JSON-RPC it uses in production, so
+ * this substitutes the SERVICE, never our code. Anything else — the chain RPC
+ * included — passes straight through.
+ */
+export function useLocalBundler(a: Addresses) {
+  const original = globalThis.fetch;
+  const bundler = localBundler({
+    rpcUrl: a.rpcUrl,
+    chainId: a.chainId,
+    entryPoint: a.entryPoint,
+    paymaster: a.paymaster,
+    sponsorKey: a.sponsorKey,
+    bundlerKey: a.bundlerKey,
+    entryPointAbi: ENTRYPOINT_WITH_HANDLE_OPS,
+  });
+  globalThis.fetch = ((url: any, init: any) =>
+    String(url).includes("local-bundler")
+      ? bundler(String(url), init)
+      : (original as any)(url, init)) as typeof fetch;
+  return { bundler, restore: () => void (globalThis.fetch = original) };
+}
+
+/** The EntryPoint ABI plus `handleOps`, which only a bundler needs. */
+export const ENTRYPOINT_WITH_HANDLE_OPS = [
+  ...ENTRYPOINT_ABI,
+  {
+    type: "function",
+    name: "handleOps",
+    stateMutability: "nonpayable",
+    inputs: [
+      {
+        name: "ops",
+        type: "tuple[]",
+        components: [
+          { name: "sender", type: "address" },
+          { name: "nonce", type: "uint256" },
+          { name: "initCode", type: "bytes" },
+          { name: "callData", type: "bytes" },
+          { name: "accountGasLimits", type: "bytes32" },
+          { name: "preVerificationGas", type: "uint256" },
+          { name: "gasFees", type: "bytes32" },
+          { name: "paymasterAndData", type: "bytes" },
+          { name: "signature", type: "bytes" },
+        ],
+      },
+      { name: "beneficiary", type: "address" },
+    ],
+    outputs: [],
+  },
+] as const;
+
+/**
+ * Creates a link's account and binds it to the link on the Router.
+ *
+ * This is the merchant app's job in production, batched into the same operation
+ * that creates the link. A link without it looks correctly created and can
+ * never be paid, so every test that creates a link must do this too.
+ */
+export async function registerLinkAgent(
+  env: Env,
+  linkId: string,
+  merchantWallet: any,
+  routerAddress: string
+): Promise<string> {
+  const account = await createLinkWallet(env, linkId, 3600, (owner) =>
+    predictAccount(env, owner)
+  );
+  await merchantWallet.writeContract({
+    address: routerAddress as `0x${string}`,
+    abi: LINK_ROUTER_ABI,
+    functionName: "registerAgent",
+    args: [linkId as `0x${string}`, account],
+  });
+  return account;
 }
 
 async function rpc(url: string, method: string, params: unknown[]): Promise<void> {
@@ -222,3 +328,52 @@ export const increaseTime = (url: string, seconds: number) =>
 
 export const mineBlocks = (url: string, n: number) =>
   Promise.all(Array.from({ length: n }, () => rpc(url, "evm_mine", []))).then(() => undefined);
+
+/**
+ * The customer's browser keypair.
+ *
+ * A REAL key, not a placeholder. The suites used a made-up `04ab…` pubkey,
+ * which was fine while the customer's key only received encrypted payment
+ * details. It is not fine now: the same key must sign "I have paid", and the
+ * Router checks that signature against the address derived from this very
+ * pubkey. A fake one cannot sign, and pretending otherwise would test a path
+ * no real customer takes.
+ */
+export const CUSTOMER_KEY =
+  "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6" as `0x${string}`;
+
+export const customerAccount = privateKeyToAccount(CUSTOMER_KEY);
+
+/** The uncompressed public key, in the `04…` form the pay endpoint expects. */
+export const CUSTOMER_PUBKEY = customerAccount.publicKey.slice(2);
+
+/**
+ * The customer signing over one action and one order.
+ *
+ * EIP-712, with the domain bound to this chain and this Router — so a signature
+ * cannot be replayed on another chain or against another deployment, and a
+ * cancel authorisation cannot be reused as a payment.
+ */
+export function signRelayAction(
+  a: Addresses,
+  action: "MarkPaid" | "Cancel",
+  linkId: string,
+  orderId: bigint
+): Promise<`0x${string}`> {
+  return customerAccount.signTypedData({
+    domain: {
+      name: "P2P LinkRouter",
+      version: "1",
+      chainId: a.chainId,
+      verifyingContract: a.router as `0x${string}`,
+    },
+    types: {
+      [action]: [
+        { name: "linkId", type: "bytes32" },
+        { name: "orderId", type: "uint256" },
+      ],
+    },
+    primaryType: action,
+    message: { linkId: linkId as `0x${string}`, orderId },
+  });
+}

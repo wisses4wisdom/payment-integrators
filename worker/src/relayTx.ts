@@ -26,12 +26,14 @@
  *      the request to something the merchant actually authorised.
  */
 
-import { decodeFunctionData, encodeFunctionData, type Address, type Hex } from "viem";
-import { RELAY_INTENTS, ORDER_ID_ABI, INTEGRATOR_ABI, limitsFor, type Env } from "./config";
-import { publicClientFor, relayerFor } from "./chain";
+import { decodeFunctionData, type Address, type Hex } from "viem";
+import { RELAY_INTENTS, ORDER_ID_ABI, INTEGRATOR_ABI, LINK_ROUTER_ABI, type Env } from "./config";
+import { publicClientFor } from "./chain";
 import { json, badRequest, clientIp, isAddress } from "./http";
 import { claimFromRequest, verifyClaim } from "./orderClaim";
-import { checkRateLimits, reserveGas, releaseGas, gasPriceFor } from "./limits";
+import { checkRateLimits } from "./limits";
+import { markPaid, cancelOrder } from "./linkOps";
+import { linkWalletAddress } from "./linkWallet";
 import { verifyTurnstile, turnstileTokenFrom } from "./turnstile";
 import { blockedForFalseClaims, falseClaimWarning, rememberMarkPaid } from "./claims";
 import { explainRevert } from "./pay";
@@ -41,6 +43,15 @@ interface RelayBody {
   data?: string;
   /** Proof the caller is the customer this order was placed for. */
   claimToken?: string;
+  /**
+   * The customer signing over THIS action and THIS order, EIP-712.
+   *
+   * The claim token proves the request came from the browser that placed the
+   * order. This proves it to the CHAIN, which is stronger: the Router refuses
+   * to advance or cancel without a signature from the key recorded at
+   * placement, so a full compromise of this worker still cannot settle.
+   */
+  signature?: string;
   /** Cloudflare Turnstile token (AUDIT N2). Header `cf-turnstile-response` also works. */
   turnstileToken?: string;
 }
@@ -124,79 +135,64 @@ export async function handleRelayTx(req: Request, env: Env): Promise<Response> {
   const limited = await checkRateLimits(env, `tx:${orderId}`, ip);
   if (limited) return json({ error: limited }, 429);
 
-  const { wallet, address: relayer } = relayerFor(env);
-  const functionName = intent === "markPaid" ? "relayerMarkPaid" : "relayerCancelOrder";
+  // 6 ── The customer's own signature over THIS action and THIS order.
+  //
+  // The claim token above proves the request came from the browser that placed
+  // the order. This proves it to the CHAIN, which is a different and stronger
+  // thing: the Router will not advance or cancel an order without a signature
+  // from the key recorded when it was placed. So a compromise of this worker —
+  // every link key and the master secret — still cannot settle anything,
+  // because that key was generated in the customer's browser and never left it.
+  const signature = typeof body.signature === "string" ? body.signature : "";
+  if (!/^0x[0-9a-fA-F]{130}$/.test(signature)) {
+    return json({ error: "Please reload the page and try again." }, 400);
+  }
 
   // Simulate first: a revert here costs nothing and gives the customer a
-  // message they can act on.
-  const calldata = encodeFunctionData({
-    abi: INTEGRATOR_ABI,
-    functionName,
-    args: [linkId, orderId],
-  });
-
-  let gas: bigint;
+  // message they can act on, rather than a generic failure after the fact.
   try {
     await client.simulateContract({
-      account: relayer,
-      address: env.INTEGRATOR_ADDRESS as Address,
-      abi: INTEGRATOR_ABI,
-      functionName,
-      args: [linkId, orderId],
-    });
-    gas = await client.estimateGas({
-      account: relayer,
-      to: env.INTEGRATOR_ADDRESS as Address,
-      data: calldata,
+      account: (await linkAccountFor(env, linkId)) ?? undefined,
+      address: env.LINK_ROUTER_ADDRESS as Address,
+      abi: LINK_ROUTER_ABI,
+      functionName: intent === "markPaid" ? "markPaid" : "cancel",
+      args: [linkId, orderId, signature as Hex],
     });
   } catch (err) {
     return json({ error: explainRevert(err) }, 409);
   }
 
-  // Book what we will actually SEND, priced in wei — see limits.ts.
-  const sendGas = (gas * limitsFor(env).gasBufferPct) / 100n;
-  const gasPrice = await gasPriceFor(client);
-  // AUDIT N2. Scoped by link. The merchant is not read here — it would cost an
-  // extra RPC round-trip on the hot path, and the per-link slice already bounds
-  // the blast radius of the order this call is advancing.
-  const gasScope = { linkId: String(linkId) };
-  const capped = await reserveGas(env, sendGas, gasPrice, gasScope);
-  if (capped) return json({ error: capped }, 503);
+  // 7 ── Drive it as the link's OWN account. No funded key, no shared nonce,
+  //      and no gas ceiling to book against — the sponsorship policy decides
+  //      before the operation reaches the chain.
+  const result =
+    intent === "markPaid"
+      ? await markPaid(env, linkId, orderId, signature as Hex)
+      : await cancelOrder(env, linkId, orderId, signature as Hex);
 
-  const nonceStub = env.NONCE.get(env.NONCE.idFromName("relayer"));
-  const { nonce } = (await (await nonceStub.fetch("https://nonce/allocate")).json()) as {
-    nonce: number;
-  };
-
-  try {
-    const hash = await wallet.writeContract({
-      account: wallet.account!,
-      chain: wallet.chain,
-      address: env.INTEGRATOR_ADDRESS as Address,
-      abi: INTEGRATOR_ABI,
-      functionName,
-      args: [linkId, orderId],
-      nonce,
-      gas: sendGas,
-    });
-
-    if (intent === "markPaid") {
-      // Remember who claimed payment, so the scheduled run can turn a later
-      // cancellation into a strike against them rather than against the merchant.
-      await rememberMarkPaid(env, orderId, ip);
-
-      // One strike is a warning, not a refusal. Someone whose bank transfer
-      // genuinely failed last time is far more likely than an attacker, and
-      // telling them plainly is both fairer and more effective than silently
-      // counting down to a block they never saw coming.
-      const warning = await falseClaimWarning(env, ip);
-      if (warning) return json({ hash, warning });
-    }
-
-    return json({ hash });
-  } catch (err) {
-    await releaseGas(env, sendGas, gasPrice, gasScope);
-    await nonceStub.fetch("https://nonce/resync");
-    return json({ error: explainRevert(err) }, 502);
+  if (!result.ok) {
+    return json({ error: result.error ?? "This payment could not be processed." }, 502);
   }
+
+  const hash = result.txHash ?? result.userOpHash!;
+
+  if (intent === "markPaid") {
+    // Remember who claimed payment, so the scheduled run can turn a later
+    // cancellation into a strike against them rather than against the merchant.
+    await rememberMarkPaid(env, orderId, ip);
+
+    // One strike is a warning, not a refusal. Someone whose bank transfer
+    // genuinely failed last time is far more likely than an attacker, and
+    // telling them plainly is both fairer and more effective than silently
+    // counting down to a block they never saw coming.
+    const warning = await falseClaimWarning(env, ip);
+    if (warning) return json({ hash, warning });
+  }
+
+  return json({ hash });
+}
+
+/** The link's account, for simulating as the caller that will really send. */
+async function linkAccountFor(env: Env, linkId: string): Promise<Address | null> {
+  return (await linkWalletAddress(env, linkId)) as Address | null;
 }

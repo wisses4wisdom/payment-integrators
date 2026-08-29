@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import {
   createPublicClient,
   createWalletClient,
@@ -40,7 +40,7 @@ import { handlePay } from "../src/pay";
 import { handleRelayTx } from "../src/relayTx";
 import { INTEGRATOR_ABI, type Env } from "../src/config";
 import { readLink, linkBlockedReason } from "../src/chain";
-import { makeTestEnv, mineBlocks, increaseTime } from "./harness";
+import { makeTestEnv, mineBlocks, increaseTime, useLocalBundler, registerLinkAgent, CUSTOMER_PUBKEY, signRelayAction } from "./harness";
 
 /**
  * End-to-end against a real chain.
@@ -73,7 +73,9 @@ const merchantWallet = createWalletClient({
 });
 
 const INR = toHex("INR", { size: 32 });
-const PUBKEY = "04" + "ab".repeat(64);
+// A REAL keypair — see harness. The customer's key must now sign, not just
+// receive, so a placeholder would test a path no real customer takes.
+const PUBKEY = CUSTOMER_PUBKEY;
 const USDC = (n: number) => parseUnits(String(n), 6);
 
 let env: Env;
@@ -128,6 +130,13 @@ async function createLink(opts: {
     chain,
   });
   await pub.waitForTransactionReceipt({ hash });
+
+  // The link's own account, bound to it on the Router. In production the
+  // merchant app batches this into the very operation that creates the link —
+  // a link without it looks correctly created and can never be paid, so every
+  // path that creates one must do this too.
+  await registerLinkAgent(env, linkId, merchantWallet, addresses.router);
+
   return linkId;
 }
 
@@ -148,8 +157,19 @@ function payRequest(body: Record<string, unknown> = {}, ip?: string): Request {
   });
 }
 
+/**
+ * The bundler and paymaster are SERVICES, not our code, so they are the only
+ * thing substituted here. Everything in `src/` — packing the operation,
+ * requesting sponsorship, reading the outcome flag — runs exactly as it will in
+ * production, which is what keeps this suite able to catch a packing mistake
+ * rather than agreeing with one.
+ */
+let bundlerHandle: ReturnType<typeof useLocalBundler>;
+afterAll(() => bundlerHandle?.restore());
+
 beforeAll(async () => {
   env = makeTestEnv(addresses);
+  bundlerHandle = useLocalBundler(addresses);
 
   // The contract caps a merchant at 25 orders per UTC day, and link payments
   // count toward it — correct behaviour, but this suite places more than that.
@@ -444,14 +464,14 @@ describe.skipIf(!HAS_E2E_FIXTURE)("E2E · relay-tx forwarding", () => {
   }
 
   let relaySeq = 0;
-  function relayReq(to: string, data: string): Request {
+  function relayReq(to: string, data: string, signature?: string): Request {
     return new Request("https://worker/api/relay-tx", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "CF-Connecting-IP": `198.51.100.${(relaySeq++ % 200) + 1}`,
       },
-      body: JSON.stringify({ to, data }),
+      body: JSON.stringify({ to, data, ...(signature ? { signature } : {}) }),
     });
   }
 
@@ -571,7 +591,7 @@ describe.skipIf(!HAS_E2E_FIXTURE)("E2E · the relayer's boundary is structural",
 });
 
 describe.skipIf(!HAS_E2E_FIXTURE)("E2E · gas accounting", () => {
-  /** The budget now lives in a Durable Object, not a KV key. */
+  /** The old daily wei budget, which existed to protect the relayer's float. */
   async function spentWei(): Promise<bigint> {
     const stub = env.GAS_BUDGET.get(env.GAS_BUDGET.idFromName("relayer"));
     const res = await stub.fetch("https://gas/read", {
@@ -582,21 +602,38 @@ describe.skipIf(!HAS_E2E_FIXTURE)("E2E · gas accounting", () => {
     return BigInt(spent);
   }
 
-  it("charges the daily budget for a real payment", async () => {
+  it("no longer meters a daily wei budget — there is no float to protect", async () => {
+    // This test used to assert the opposite, and the inversion is the point.
+    //
+    // The daily wei ceiling existed because one funded key paid for every
+    // payment: without metering, a spam wave drained it and every merchant's
+    // links went dark. That key is gone. The sender now holds nothing, gas is
+    // sponsored, and spending is bounded by the sponsorship policy BEFORE an
+    // operation reaches the chain rather than by us counting after the money
+    // has already been spent.
+    //
+    // Asserting the counter stays at zero pins that the old path really is
+    // unused, rather than quietly still signing from the relayer alongside.
     const before = await spentWei();
 
     const linkId = await createLink({ id: "e2e-gas", amount: USDC(1) });
     const res = await handlePay(payRequest(), env, linkId);
     expect(res.status).toBe(200);
 
-    const after = await spentWei();
-    expect(after).toBeGreaterThan(before);
+    expect(await spentWei()).toBe(before);
+  });
 
-    // Charged in WEI now, so the bound has to be priced. A single payment must
-    // not be wildly off the measured ~348k gas average; allow the 20% send
-    // buffer and a generous local gas price on top.
-    const gasPrice = await pub.getGasPrice();
-    expect(after - before).toBeLessThan(600_000n * gasPrice);
+  it("the relayer wallet's balance is untouched by a payment", async () => {
+    // The strongest form of the same claim: the funded key is not merely
+    // unmetered, it is not spending. When it is deleted at cutover, nothing on
+    // this path changes.
+    const relayer = privateKeyToAccount(addresses.relayerKey as Hex).address;
+    const before = await pub.getBalance({ address: relayer });
+
+    const linkId = await createLink({ id: "e2e-gas-balance", amount: USDC(1) });
+    expect((await handlePay(payRequest(), env, linkId)).status).toBe(200);
+
+    expect(await pub.getBalance({ address: relayer })).toBe(before);
   });
 });
 
@@ -649,6 +686,17 @@ describe.skipIf(!HAS_E2E_FIXTURE)("E2E · settlement parity", () => {
       ] as const,
       functionName: "simulateOrderComplete",
       args: [BigInt(orderId)],
+      // An EXPLICIT limit, because estimation cannot be trusted for this call.
+      // MockDiamond CATCHES a failing onOrderComplete — as the real gateway
+      // does — so `eth_estimateGas` binary-searches to the smallest gas that
+      // makes the TRANSACTION succeed, which is the amount where the callback
+      // is SKIPPED. The order then reads as completed while the USDC sits
+      // stranded on the proxy and the merchant is never credited.
+      //
+      // This surfaced only once the shared node had accumulated enough
+      // settlement buckets to make the callback expensive, which is exactly
+      // how it would surface in production: fine early, silently wrong later.
+      gas: 3_000_000n,
       account: deployer.account!,
       chain,
     });

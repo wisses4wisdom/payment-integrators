@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
 import {
   createPublicClient,
@@ -76,7 +76,7 @@ const MERCHANT_ABI = [
     ],
   },
 ] as const;
-import { makeTestEnv, type Addresses } from "./harness";
+import { makeTestEnv, type Addresses, useLocalBundler, registerLinkAgent, CUSTOMER_PUBKEY, signRelayAction } from "./harness";
 
 /**
  * Adversarial end-to-end.
@@ -139,7 +139,10 @@ const merchantWallet = createWalletClient({
 
 const USDC = (n: number) => BigInt(n) * 1_000_000n;
 const INR = ("0x" + Buffer.from("INR").toString("hex").padEnd(64, "0")) as Hex;
-const PK = "04" + "ab".repeat(64);
+// A REAL keypair. The same key the LP encrypts payment details to is now the
+// key that must sign "I have paid", so a placeholder pubkey could not sign and
+// would test a path no real customer takes.
+const PK = CUSTOMER_PUBKEY;
 
 const PAID_SELECTOR = "0x1e31508e";
 const CANCEL_SELECTOR = "0x514fcac7";
@@ -164,6 +167,12 @@ async function createLink(opts: { amount: bigint; maxUses?: number }): Promise<H
     args: [linkId, opts.amount, INR, 0n, opts.maxUses ?? 0, "0x"],
   });
   await pub.waitForTransactionReceipt({ hash });
+
+  // The link's own account, bound to it on the Router. In production the
+  // merchant app batches this into the operation that creates the link; a link
+  // without it looks correctly created and can never be paid.
+  await registerLinkAgent(env, linkId, merchantWallet, addresses.router);
+
   return linkId;
 }
 
@@ -174,21 +183,50 @@ const payRequest = (ip = "198.51.100.1", body: Record<string, unknown> = {}) =>
     body: JSON.stringify({ pubKey: PK, ...body }),
   });
 
-const relayRequest = (
+/**
+ * Builds a relay request, signing as the customer when one is implied.
+ *
+ * A claim token means "this is the browser that placed the order" — the
+ * legitimate customer — so the request also carries that customer's signature,
+ * because a real one would. Requests WITHOUT a claim token are the ones probing
+ * other gates (wrong target, smuggled argument, someone else's order), and they
+ * deliberately stay unsigned so those gates are what gets tested.
+ *
+ * Async because signing is: the link is read from the chain so the signature is
+ * bound to the same order the request names.
+ */
+const relayRequest = async (
   data: string,
   ip = "198.51.100.1",
   to = addresses.diamond,
-  claimToken?: string | null
-) =>
-  new Request("https://worker/api/relay-tx", {
+  claimToken?: string | null,
+  signature?: string
+): Promise<Request> => {
+  let sig = signature;
+  // Only well-formed calldata (selector + one uint256) can be signed for. The
+  // malformed and smuggled payloads some tests send must reach the endpoint's
+  // own guards, not fail here.
+  if (!sig && claimToken && data.length === 2 + 8 + 64) {
+    const orderId = BigInt("0x" + data.slice(10));
+    const linkId = (await pub.readContract({
+      address: addresses.integrator as Address,
+      abi: INTEGRATOR_ABI,
+      functionName: "orderToLink",
+      args: [orderId],
+    })) as Hex;
+    const action = data.slice(0, 10).toLowerCase() === PAID_SELECTOR ? "MarkPaid" : "Cancel";
+    sig = await signRelayAction(addresses, action, linkId, orderId);
+  }
+  return new Request("https://worker/api/relay-tx", {
     method: "POST",
     headers: {
       "CF-Connecting-IP": ip,
       "Content-Type": "application/json",
       ...(claimToken ? { "X-Payment-Claim": claimToken } : {}),
     },
-    body: JSON.stringify({ to, data }),
+    body: JSON.stringify({ to, data, ...(sig ? { signature: sig } : {}) }),
   });
+};
 
 const orderCall = (selector: string, orderId: bigint) =>
   selector + orderId.toString(16).padStart(64, "0");
@@ -268,8 +306,15 @@ async function pay(linkId: Hex, ip = "198.51.100.1", body: Record<string, unknow
   };
 }
 
+let bundlerHandle: ReturnType<typeof useLocalBundler>;
+afterAll(() => bundlerHandle?.restore());
+
 beforeAll(async () => {
   if (!HAS_E2E_FIXTURE) return;
+
+  // Substitute the bundler and paymaster SERVICES only. Everything in src/
+  // runs exactly as it will in production.
+  bundlerHandle = useLocalBundler(addresses);
 
   const admin = createWalletClient({
     account: privateKeyToAccount(
@@ -336,7 +381,7 @@ describe.skipIf(!HAS_E2E_FIXTURE)("HARDEN · a link payment actually completes",
     // 2. Customer taps "I have paid" — THE step that was impossible before.
     await acceptOrder(orderId!);
     const relayRes = await handleRelayTx(
-      relayRequest(orderCall(PAID_SELECTOR, orderId!), "198.51.100.1", addresses.diamond, claim),
+      await relayRequest(orderCall(PAID_SELECTOR, orderId!), "198.51.100.1", addresses.diamond, claim),
       env
     );
     const relayBody = (await relayRes.json()) as { hash?: string; error?: string };
@@ -373,6 +418,17 @@ describe.skipIf(!HAS_E2E_FIXTURE)("HARDEN · a link payment actually completes",
       ] as const,
       functionName: "simulateOrderComplete",
       args: [orderId!],
+      // An EXPLICIT limit, because estimation cannot be trusted for this call.
+      // MockDiamond CATCHES a failing onOrderComplete — as the real gateway
+      // does — so `eth_estimateGas` binary-searches to the smallest gas that
+      // makes the TRANSACTION succeed, which is the amount where the callback
+      // is SKIPPED. The order then reads as completed while the USDC sits
+      // stranded on the proxy and the merchant is never credited.
+      //
+      // This surfaced only once the shared node had accumulated enough
+      // settlement buckets to make the callback expensive, which is exactly
+      // how it would surface in production: fine early, silently wrong later.
+      gas: 3_000_000n,
     });
     await pub.waitForTransactionReceipt({ hash: done });
 
@@ -397,7 +453,7 @@ describe.skipIf(!HAS_E2E_FIXTURE)("HARDEN · a link payment actually completes",
     expect((await readLink(linkId))[6]).toBe(1); // uses
 
     const res = await handleRelayTx(
-      relayRequest(orderCall(CANCEL_SELECTOR, orderId!), "198.51.100.1", addresses.diamond, claim),
+      await relayRequest(orderCall(CANCEL_SELECTOR, orderId!), "198.51.100.1", addresses.diamond, claim),
       env
     );
     const body = (await res.json()) as { error?: string };
@@ -442,7 +498,7 @@ describe.skipIf(!HAS_E2E_FIXTURE)(
       const posOrderId = nextId - 1n;
 
       for (const sel of [PAID_SELECTOR, CANCEL_SELECTOR]) {
-        const res = await handleRelayTx(relayRequest(orderCall(sel, posOrderId)), env);
+        const res = await handleRelayTx(await relayRequest(orderCall(sel, posOrderId)), env);
         expect(res.status).toBe(403);
       }
       // The merchant's own order is untouched.
@@ -450,7 +506,7 @@ describe.skipIf(!HAS_E2E_FIXTURE)(
     });
 
     it("refuses an order id that does not exist at all", async () => {
-      const res = await handleRelayTx(relayRequest(orderCall(PAID_SELECTOR, 999_999n)), env);
+      const res = await handleRelayTx(await relayRequest(orderCall(PAID_SELECTOR, 999_999n)), env);
       expect(res.status).toBe(403);
     });
 
@@ -461,7 +517,7 @@ describe.skipIf(!HAS_E2E_FIXTURE)(
       // A VALID token, so it is the target check that refuses — not the token.
       for (const target of [addresses.integrator, addresses.usdc, addresses.client]) {
         const res = await handleRelayTx(
-          relayRequest(orderCall(PAID_SELECTOR, orderId!), "198.51.100.9", target, claim),
+          await relayRequest(orderCall(PAID_SELECTOR, orderId!), "198.51.100.9", target, claim),
           env
         );
         expect(res.status).toBe(403);
@@ -477,12 +533,12 @@ describe.skipIf(!HAS_E2E_FIXTURE)(
       // refuse rather than the token gate.
       const foreign = "0x" + "deadbeef" + orderId!.toString(16).padStart(64, "0");
       expect(
-        (await handleRelayTx(relayRequest(foreign, "198.51.100.1", D, claim), env)).status
+        (await handleRelayTx(await relayRequest(foreign, "198.51.100.1", D, claim), env)).status
       ).toBe(403);
 
       const smuggled = orderCall(PAID_SELECTOR, orderId!) + "11".repeat(32);
       expect(
-        (await handleRelayTx(relayRequest(smuggled, "198.51.100.1", D, claim), env)).status
+        (await handleRelayTx(await relayRequest(smuggled, "198.51.100.1", D, claim), env)).status
       ).toBe(403);
 
       expect((await readOrder(orderId!))[7]).toBe(false);
@@ -491,12 +547,12 @@ describe.skipIf(!HAS_E2E_FIXTURE)(
     it("cannot mark the same order paid twice", async () => {
       const linkId = await createLink({ amount: USDC(1) });
       const { orderId, claim } = await pay(linkId);
-      const req = () =>
-        relayRequest(orderCall(PAID_SELECTOR, orderId!), "198.51.100.1", addresses.diamond, claim);
+      const req = async () =>
+        await relayRequest(orderCall(PAID_SELECTOR, orderId!), "198.51.100.1", addresses.diamond, claim);
 
       await acceptOrder(orderId!);
-      expect((await handleRelayTx(req(), env)).status).toBe(200);
-      const second = await handleRelayTx(req(), env);
+      expect((await handleRelayTx(await req(), env)).status).toBe(200);
+      const second = await handleRelayTx(await req(), env);
       expect(second.status).toBeGreaterThanOrEqual(400);
     });
   }
@@ -677,7 +733,7 @@ describe.skipIf(!HAS_E2E_FIXTURE)("HARDEN · multi-use links and false claims", 
     const good = await pay(linkId, "198.51.100.40");
     await acceptOrder(good.orderId!);
     await handleRelayTx(
-      relayRequest(
+      await relayRequest(
         orderCall(PAID_SELECTOR, good.orderId!),
         "198.51.100.40",
         addresses.diamond,
@@ -706,6 +762,17 @@ describe.skipIf(!HAS_E2E_FIXTURE)("HARDEN · multi-use links and false claims", 
       ] as const,
       functionName: "simulateOrderComplete",
       args: [good.orderId!],
+      // An EXPLICIT limit, because estimation cannot be trusted for this call.
+      // MockDiamond CATCHES a failing onOrderComplete — as the real gateway
+      // does — so `eth_estimateGas` binary-searches to the smallest gas that
+      // makes the TRANSACTION succeed, which is the amount where the callback
+      // is SKIPPED. The order then reads as completed while the USDC sits
+      // stranded on the proxy and the merchant is never credited.
+      //
+      // This surfaced only once the shared node had accumulated enough
+      // settlement buckets to make the callback expensive, which is exactly
+      // how it would surface in production: fine early, silently wrong later.
+      gas: 3_000_000n,
     });
     await pub.waitForTransactionReceipt({ hash: h });
     expect((await readLink(linkId))[7]).toBe(0); // cleared
@@ -714,7 +781,7 @@ describe.skipIf(!HAS_E2E_FIXTURE)("HARDEN · multi-use links and false claims", 
     const bad = await pay(linkId, "198.51.100.41");
     await acceptOrder(bad.orderId!);
     await handleRelayTx(
-      relayRequest(
+      await relayRequest(
         orderCall(PAID_SELECTOR, bad.orderId!),
         "198.51.100.41",
         addresses.diamond,
@@ -723,7 +790,7 @@ describe.skipIf(!HAS_E2E_FIXTURE)("HARDEN · multi-use links and false claims", 
       env
     );
     await handleRelayTx(
-      relayRequest(
+      await relayRequest(
         orderCall(CANCEL_SELECTOR, bad.orderId!),
         "198.51.100.41",
         addresses.diamond,
@@ -742,7 +809,7 @@ describe.skipIf(!HAS_E2E_FIXTURE)("HARDEN · multi-use links and false claims", 
       const p = await pay(linkId, `198.51.100.${60 + i}`);
       await acceptOrder(p.orderId!);
       await handleRelayTx(
-        relayRequest(
+        await relayRequest(
           orderCall(PAID_SELECTOR, p.orderId!),
           `198.51.100.${60 + i}`,
           addresses.diamond,
@@ -751,7 +818,7 @@ describe.skipIf(!HAS_E2E_FIXTURE)("HARDEN · multi-use links and false claims", 
         env
       );
       await handleRelayTx(
-        relayRequest(
+        await relayRequest(
           orderCall(CANCEL_SELECTOR, p.orderId!),
           `198.51.100.${60 + i}`,
           addresses.diamond,
@@ -791,7 +858,7 @@ describe.skipIf(!HAS_E2E_FIXTURE)(
       // sequential on the Diamond, and readable from orderToLink. That used to be
       // everything they needed.
       const res = await handleRelayTx(
-        relayRequest(orderCall(CANCEL_SELECTOR, victim.orderId!), "203.0.113.9"),
+        await relayRequest(orderCall(CANCEL_SELECTOR, victim.orderId!), "203.0.113.9"),
         env
       );
       expect(res.status).toBe(403);
@@ -800,7 +867,7 @@ describe.skipIf(!HAS_E2E_FIXTURE)(
       expect((await readOrder(victim.orderId!))[6]).toBe(false);
       await acceptOrder(victim.orderId!);
       const ok = await handleRelayTx(
-        relayRequest(
+        await relayRequest(
           orderCall(PAID_SELECTOR, victim.orderId!),
           "198.51.100.70",
           addresses.diamond,
@@ -817,7 +884,7 @@ describe.skipIf(!HAS_E2E_FIXTURE)(
       const victim = await pay(linkId, "198.51.100.71");
 
       const res = await handleRelayTx(
-        relayRequest(orderCall(PAID_SELECTOR, victim.orderId!), "203.0.113.9"),
+        await relayRequest(orderCall(PAID_SELECTOR, victim.orderId!), "203.0.113.9"),
         env
       );
       expect(res.status).toBe(403);
@@ -832,7 +899,7 @@ describe.skipIf(!HAS_E2E_FIXTURE)(
       const b = await pay(linkId, "198.51.100.73");
 
       const res = await handleRelayTx(
-        relayRequest(
+        await relayRequest(
           orderCall(CANCEL_SELECTOR, b.orderId!),
           "198.51.100.72",
           addresses.diamond,
@@ -850,7 +917,7 @@ describe.skipIf(!HAS_E2E_FIXTURE)(
 
       for (const bogus of ["f".repeat(64), "abc", "", "0x" + "a".repeat(64)]) {
         const res = await handleRelayTx(
-          relayRequest(
+          await relayRequest(
             orderCall(CANCEL_SELECTOR, orderId!),
             "198.51.100.74",
             addresses.diamond,
