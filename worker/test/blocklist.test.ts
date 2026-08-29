@@ -215,3 +215,95 @@ describe("the operator door", () => {
     expect(await blockRecord(env, IP)).not.toBeNull();
   });
 });
+
+/**
+ * The complaint flow.
+ *
+ * A block is automatic; lifting one is not. When someone says "I was blocked
+ * unfairly", the operator needs to answer one question — is this a fraudster or
+ * a shared carrier address? — and they start from that person, not from a list
+ * of everyone.
+ */
+describe("reviewing a complaint about one person", () => {
+  let env: Env;
+
+  beforeEach(() => {
+    ({ env } = fakeEnv());
+  });
+
+  const lookup = (ip: string, secret: string | null = SECRET) =>
+    handleAdmin(
+      new Request(`https://w/api/admin/blocks?ip=${encodeURIComponent(ip)}`, {
+        method: "GET",
+        headers: secret ? { "X-Admin-Secret": secret } : {},
+      }),
+      env
+    );
+
+  it("answers for one address, with when and how many", async () => {
+    await blockIp(env, IP, 3);
+    const body = (await (await lookup(IP)).json()) as any;
+
+    expect(body.blocked).toBe(true);
+    expect(body.record.strikes).toBe(3);
+    expect(body.record.at).toBeGreaterThan(0);
+  });
+
+  it("says plainly when someone is NOT blocked", async () => {
+    // The complaint may be about something else entirely; the operator needs to
+    // be able to rule this out in one call.
+    const body = (await (await lookup(OTHER)).json()) as any;
+    expect(body.blocked).toBe(false);
+    expect(body.record).toBeNull();
+    expect(body.strikes).toBe(0);
+  });
+
+  it("shows strikes even before a block, so a near-miss is visible", async () => {
+    // Someone on two strikes who is already complaining is worth seeing before
+    // they hit three and it becomes a support ticket.
+    await rememberMarkPaid(env, 1n, IP);
+    await recordFalseClaim(env, 1n);
+
+    const body = (await (await lookup(IP)).json()) as any;
+    expect(body.blocked).toBe(false);
+    expect(body.strikes).toBe(1);
+  });
+
+  it("still refuses a lookup without the secret", async () => {
+    await blockIp(env, IP, 3);
+    expect((await lookup(IP, null)).status).toBe(404);
+    expect((await lookup(IP, "wrong")).status).toBe(404);
+  });
+
+  it("rejects a lookup for something that is not an address", async () => {
+    expect((await lookup("not-an-ip")).status).toBe(400);
+  });
+
+  it("supports the whole flow: blocked, reviewed, lifted, paying again", async () => {
+    // Exactly the sequence a support ticket follows.
+    for (let i = 1; i <= MAX_FALSE_CLAIMS; i++) {
+      await rememberMarkPaid(env, BigInt(i), IP);
+      await recordFalseClaim(env, BigInt(i));
+    }
+    expect(await blockedForFalseClaims(env, IP)).toBeTruthy();
+
+    // The operator looks them up and sees the evidence.
+    const review = (await (await lookup(IP)).json()) as any;
+    expect(review.blocked).toBe(true);
+    expect(review.record.strikes).toBe(MAX_FALSE_CLAIMS);
+
+    // Decides it was a shared address and lifts it.
+    await handleAdmin(
+      new Request("https://w/api/admin/blocks", {
+        method: "DELETE",
+        headers: { "X-Admin-Secret": SECRET, "Content-Type": "application/json" },
+        body: JSON.stringify({ ip: IP }),
+      }),
+      env
+    );
+
+    // They can pay again, and are not one claim from being blocked once more.
+    expect(await blockedForFalseClaims(env, IP)).toBeNull();
+    expect(((await (await lookup(IP)).json()) as any).strikes).toBe(0);
+  });
+});

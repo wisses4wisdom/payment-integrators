@@ -69,9 +69,27 @@ export async function handleAdmin(req: Request, env: Env): Promise<Response> {
   }
 
   if (req.method === "GET") {
-    // Listing is the point: an operator reviewing a complaint needs to see WHEN
-    // and for HOW MANY strikes, which is what separates a fraudster from a
-    // shared carrier address.
+    // A complaint arrives about ONE person, so the review starts with one
+    // lookup — not by reading a list of two hundred and hoping to spot them.
+    // `?ip=` is the support path; the full list is the audit path.
+    const wanted = new URL(req.url).searchParams.get("ip");
+    if (wanted !== null) {
+      const ip = wanted.trim();
+      if (!looksLikeIp(ip)) return json({ error: "Provide a valid ip." }, 400);
+      const record = await blockRecord(env, ip);
+      return json({
+        ip,
+        blocked: record !== null,
+        record,
+        // The strike count is shown even when there is no block yet: someone on
+        // two strikes who is complaining is worth seeing before they hit three.
+        strikes: Number((await env.KV.get(`claim:strikes:${ip}`)) ?? "0"),
+      });
+    }
+
+    // Listing is the audit: an operator needs to see WHEN and for HOW MANY
+    // strikes, which is what separates a fraudster from a shared carrier
+    // address catching people who did nothing.
     return json({ blocks: await listBlocked(env) });
   }
 
