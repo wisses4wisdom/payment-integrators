@@ -40,15 +40,6 @@ export interface Env {
    *  ever sending a transaction. */
   SPONSOR_VERIFIER_SECRET?: string;
   /**
-   * Operator secret for the blocklist endpoints.
-   *
-   * Fails CLOSED when unset: the route answers 404 rather than running open.
-   * Turnstile fails OPEN for a reason that does not apply here — leaving that
-   * off degrades a spam control, while leaving this off would let anyone lift a
-   * fraud block.
-   */
-  ADMIN_SECRET?: string;
-  /**
    * Cloudflare Turnstile secret. Presence of this secret is what ENABLES the
    * human-cost gate on `/api/pay` and `/api/relay-tx` (AUDIT N2).
    *

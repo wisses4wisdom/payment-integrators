@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { privateKeyToAccount } from "viem/accounts";
 import { blockIp, unblockIp, blockRecord, listBlocked } from "../src/blocklist";
 import {
   blockedForFalseClaims,
@@ -11,25 +12,118 @@ import { handleAdmin } from "../src/admin";
 import type { Env } from "../src/config";
 
 /**
- * Blocking a repeat false claimant.
+ * Blocking a repeat false claimant, and who may undo it.
  *
- * The thing under test is a trade, not a guarantee. An IP is not a person: it
+ * The block itself is a trade, not a guarantee. An IP is not a person: it
  * OVER-blocks, because mobile carriers put very many subscribers behind one
  * address, and it UNDER-blocks, because changing networks defeats it in
  * seconds. It buys friction against casual abuse and nothing against a
  * determined attacker.
  *
  * That trade is only acceptable because an operator can see the blocks and lift
- * them, so the unblock path is tested as carefully as the block path.
+ * them — so the review path is tested at least as carefully as the block path,
+ * including who is allowed to walk it.
+ *
+ * Authority comes from the CONTRACT, not from a shared secret: the super-admin
+ * and every owner read as FINANCE, an admin assigned on-chain gains access, and
+ * one removed loses it. The chain read is stubbed here; the role semantics it
+ * models are the integrator's own `roleOf`.
  */
+
+// Hardhat account keys — public by design, and the addresses are what matter.
+const OWNER = privateKeyToAccount(
+  "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+);
+const SUPPORT_ADMIN = privateKeyToAccount(
+  "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+);
+const VIEWER = privateKeyToAccount(
+  "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"
+);
+const STRANGER = privateKeyToAccount(
+  "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6"
+);
+
+const INTEGRATOR = "0x1111111111111111111111111111111111111111";
+const CHAIN_ID = 8453;
+
+/** What the contract would answer for `roleOf`. 4 FINANCE, 2 SUPPORT, 1 VIEWER. */
+const roles = new Map<string, number>();
+let roleReadFails = false;
+
+// Stubs the ONE chain read  makes. The signature verification and
+// the tier comparison are real.
+vi.mock("../src/chain", () => ({
+  publicClientFor: () => ({
+    readContract: async ({ args }: any) => {
+      if (roleReadFails) throw new Error("rpc down");
+      return roles.get(String(args[0]).toLowerCase()) ?? 0;
+    },
+  }),
+}));
+
 const IP = "203.0.113.7";
 const OTHER = "203.0.113.9";
-const SECRET = "operator-secret-value";
+
+const nowSec = () => Math.floor(Date.now() / 1000);
+
+/** Signs an operator request the way the admin panel would. */
+async function signAdmin(
+  env: Env,
+  who: ReturnType<typeof privateKeyToAccount>,
+  msg: { action: string; ip?: string; reason?: string },
+  over: { expiry?: number; integrator?: string } = {}
+) {
+  const expiry = over.expiry ?? nowSec() + 120;
+  const ip = msg.ip ?? "";
+  const signature = await who.signTypedData({
+    domain: {
+      name: "P2P Merchant Terminal Admin",
+      version: "1",
+      chainId: CHAIN_ID,
+      verifyingContract: (over.integrator ?? INTEGRATOR) as `0x${string}`,
+    },
+    types: {
+      AdminAction: [
+        { name: "action", type: "string" },
+        { name: "ip", type: "string" },
+        { name: "expiry", type: "uint256" },
+      ],
+    },
+    primaryType: "AdminAction",
+    message: { action: msg.action, ip, expiry: BigInt(expiry) },
+  });
+  return { ...msg, signer: who.address, signature, expiry };
+}
+
+/** Signs and sends one operator request. */
+async function admin(
+  env: Env,
+  who: ReturnType<typeof privateKeyToAccount>,
+  msg: { action: string; ip?: string; reason?: string },
+  over: { expiry?: number; integrator?: string } = {}
+) {
+  const body = await signAdmin(env, who, msg, over);
+  return handleAdmin(
+    new Request("https://w/api/admin/blocks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+    env
+  );
+}
 
 function fakeEnv(over: Partial<Env> = {}): { env: Env; store: Map<string, string> } {
+  roles.clear();
+  roles.set(OWNER.address.toLowerCase(), 4); // super-admin / owner
+  roles.set(SUPPORT_ADMIN.address.toLowerCase(), 2);
+  roles.set(VIEWER.address.toLowerCase(), 1);
+
   const store = new Map<string, string>();
   const env = {
-    ADMIN_SECRET: SECRET,
+    CHAIN_ID: String(CHAIN_ID),
+    INTEGRATOR_ADDRESS: INTEGRATOR,
     KV: {
       get: async (k: string) => store.get(k) ?? null,
       put: async (k: string, v: string) => void store.set(k, v),
@@ -45,7 +139,6 @@ function fakeEnv(over: Partial<Env> = {}): { env: Env; store: Map<string, string
   } as Env;
   return { env, store };
 }
-
 describe("earning a block", () => {
   let env: Env;
 
@@ -122,108 +215,55 @@ describe("lifting a block", () => {
     await blockIp(env, IP, 3);
   });
 
-  const admin = (method: string, body?: unknown, secret: string | null = SECRET) =>
-    handleAdmin(
-      new Request("https://w/api/admin/blocks", {
-        method,
-        headers: {
-          "Content-Type": "application/json",
-          ...(secret ? { "X-Admin-Secret": secret } : {}),
-        },
-        ...(body ? { body: JSON.stringify(body) } : {}),
-      }),
-      env
-    );
-
   it("unblocks, and clears the strikes with it", async () => {
     // Leaving the count would put a wrongly-blocked person one claim from being
     // blocked again — not what an operator means by "unblock".
     await env.KV.put(`claim:strikes:${IP}`, "3");
-    const res = await admin("DELETE", { ip: IP });
+    const res = await admin(env, OWNER, { action: "unblock", ip: IP });
 
     expect(res.status).toBe(200);
     expect(await blockedForFalseClaims(env, IP)).toBeNull();
     expect(await env.KV.get(`claim:strikes:${IP}`)).toBeNull();
   });
 
+  it("records WHICH wallet acted", async () => {
+    // The reason a shared secret was not good enough: "someone with the
+    // password did this" is not an answer when the action is overriding a
+    // fraud decision.
+    const body = (await (await admin(env, OWNER, { action: "unblock", ip: IP })).json()) as any;
+    expect(body.by).toBe(OWNER.address);
+  });
+
   it("lists blocks so over-blocking is visible", async () => {
-    // A control that can catch innocent people and cannot be audited is a
-    // liability, not a control.
     await blockIp(env, OTHER, 5, "manual");
-    const body = (await (await admin("GET")).json()) as { blocks: any[] };
-    const ips = body.blocks.map((b) => b.ip);
+    const body = (await (await admin(env, OWNER, { action: "list" })).json()) as any;
+    const ips = body.blocks.map((b: any) => b.ip);
     expect(ips).toContain(IP);
     expect(ips).toContain(OTHER);
-    expect(body.blocks.find((b) => b.ip === OTHER).record.reason).toBe("manual");
   });
 
   it("lets an operator block by hand", async () => {
-    const res = await admin("POST", { ip: OTHER, reason: "confirmed abuse" });
+    const res = await admin(env, OWNER, {
+      action: "block",
+      ip: OTHER,
+      reason: "confirmed abuse",
+    });
     expect(res.status).toBe(200);
     expect((await blockRecord(env, OTHER))!.reason).toBe("confirmed abuse");
   });
 
   it("reports honestly when there was nothing to unblock", async () => {
-    const body = (await (await admin("DELETE", { ip: OTHER })).json()) as { unblocked: boolean };
+    const body = (await (await admin(env, OWNER, { action: "unblock", ip: OTHER })).json()) as any;
     expect(body.unblocked).toBe(false);
   });
 
   it("rejects anything that is not an address", async () => {
     for (const bad of ["", "not-an-ip", "1.2.3", "'; DROP", "a".repeat(200)]) {
-      expect((await admin("DELETE", { ip: bad })).status).toBe(400);
+      expect((await admin(env, OWNER, { action: "unblock", ip: bad })).status).toBe(400);
     }
   });
 });
 
-describe("the operator door", () => {
-  it("answers 404 without the secret — not 401", async () => {
-    // A 401 confirms the endpoint exists. 404 says nothing.
-    const { env } = fakeEnv();
-    await blockIp(env, IP, 3);
-
-    for (const secret of [null, "wrong", SECRET.slice(0, -1)]) {
-      const res = await handleAdmin(
-        new Request("https://w/api/admin/blocks", {
-          method: "DELETE",
-          headers: secret ? { "X-Admin-Secret": secret } : {},
-          body: JSON.stringify({ ip: IP }),
-        }),
-        env
-      );
-      expect(res.status).toBe(404);
-    }
-    // And nothing was lifted.
-    expect(await blockRecord(env, IP)).not.toBeNull();
-  });
-
-  it("fails CLOSED when no secret is configured", async () => {
-    // Turnstile fails open, for a reason that does not apply here: leaving that
-    // off degrades a spam control, while leaving this off would let anyone lift
-    // a fraud block.
-    const { env } = fakeEnv({ ADMIN_SECRET: undefined });
-    await blockIp(env, IP, 3);
-
-    const res = await handleAdmin(
-      new Request("https://w/api/admin/blocks", {
-        method: "DELETE",
-        headers: { "X-Admin-Secret": "anything" },
-        body: JSON.stringify({ ip: IP }),
-      }),
-      env
-    );
-    expect(res.status).toBe(404);
-    expect(await blockRecord(env, IP)).not.toBeNull();
-  });
-});
-
-/**
- * The complaint flow.
- *
- * A block is automatic; lifting one is not. When someone says "I was blocked
- * unfairly", the operator needs to answer one question — is this a fraudster or
- * a shared carrier address? — and they start from that person, not from a list
- * of everyone.
- */
 describe("reviewing a complaint about one person", () => {
   let env: Env;
 
@@ -231,18 +271,11 @@ describe("reviewing a complaint about one person", () => {
     ({ env } = fakeEnv());
   });
 
-  const lookup = (ip: string, secret: string | null = SECRET) =>
-    handleAdmin(
-      new Request(`https://w/api/admin/blocks?ip=${encodeURIComponent(ip)}`, {
-        method: "GET",
-        headers: secret ? { "X-Admin-Secret": secret } : {},
-      }),
-      env
-    );
+  const lookup = (who = OWNER) => admin(env, who, { action: "lookup", ip: IP });
 
   it("answers for one address, with when and how many", async () => {
     await blockIp(env, IP, 3);
-    const body = (await (await lookup(IP)).json()) as any;
+    const body = (await (await lookup()).json()) as any;
 
     expect(body.blocked).toBe(true);
     expect(body.record.strikes).toBe(3);
@@ -250,33 +283,19 @@ describe("reviewing a complaint about one person", () => {
   });
 
   it("says plainly when someone is NOT blocked", async () => {
-    // The complaint may be about something else entirely; the operator needs to
-    // be able to rule this out in one call.
-    const body = (await (await lookup(OTHER)).json()) as any;
+    const body = (await (await lookup()).json()) as any;
     expect(body.blocked).toBe(false);
     expect(body.record).toBeNull();
     expect(body.strikes).toBe(0);
   });
 
   it("shows strikes even before a block, so a near-miss is visible", async () => {
-    // Someone on two strikes who is already complaining is worth seeing before
-    // they hit three and it becomes a support ticket.
     await rememberMarkPaid(env, 1n, IP);
     await recordFalseClaim(env, 1n);
 
-    const body = (await (await lookup(IP)).json()) as any;
+    const body = (await (await lookup()).json()) as any;
     expect(body.blocked).toBe(false);
     expect(body.strikes).toBe(1);
-  });
-
-  it("still refuses a lookup without the secret", async () => {
-    await blockIp(env, IP, 3);
-    expect((await lookup(IP, null)).status).toBe(404);
-    expect((await lookup(IP, "wrong")).status).toBe(404);
-  });
-
-  it("rejects a lookup for something that is not an address", async () => {
-    expect((await lookup("not-an-ip")).status).toBe(400);
   });
 
   it("supports the whole flow: blocked, reviewed, lifted, paying again", async () => {
@@ -287,23 +306,161 @@ describe("reviewing a complaint about one person", () => {
     }
     expect(await blockedForFalseClaims(env, IP)).toBeTruthy();
 
-    // The operator looks them up and sees the evidence.
-    const review = (await (await lookup(IP)).json()) as any;
+    const review = (await (await lookup()).json()) as any;
     expect(review.blocked).toBe(true);
     expect(review.record.strikes).toBe(MAX_FALSE_CLAIMS);
 
-    // Decides it was a shared address and lifts it.
-    await handleAdmin(
+    await admin(env, OWNER, { action: "unblock", ip: IP });
+
+    expect(await blockedForFalseClaims(env, IP)).toBeNull();
+    expect(((await (await lookup()).json()) as any).strikes).toBe(0);
+  });
+});
+
+describe("who the contract says may do this", () => {
+  let env: Env;
+
+  beforeEach(async () => {
+    ({ env } = fakeEnv());
+    await blockIp(env, IP, 3);
+  });
+
+  const unblock = (who: ReturnType<typeof privateKeyToAccount>) =>
+    admin(env, who, { action: "unblock", ip: IP });
+
+  it("admits the super-admin, who reads as FINANCE", async () => {
+    // The super-admin is always also an owner, so `roleOf` reports 4. They get
+    // this access without anyone granting it separately — which is the point.
+    expect((await unblock(OWNER)).status).toBe(200);
+  });
+
+  it("admits an admin the super-admin assigned", async () => {
+    // Authority here FOLLOWS authority on the contract: assign SUPPORT on-chain
+    // and they can review blocks, with nothing to configure here.
+    expect((await unblock(SUPPORT_ADMIN)).status).toBe(200);
+  });
+
+  it("refuses a wallet with no role", async () => {
+    expect((await unblock(STRANGER)).status).toBe(404);
+    expect(await blockRecord(env, IP)).not.toBeNull();
+  });
+
+  it("refuses VIEWER — reading the contract is not acting on it", async () => {
+    expect((await unblock(VIEWER)).status).toBe(404);
+    expect(await blockRecord(env, IP)).not.toBeNull();
+  });
+
+  it("refuses a wallet removed from the role since it last acted", async () => {
+    // Revocation is the whole advantage over a shared secret: taking the role
+    // away on-chain takes this away too, with nothing to rotate.
+    expect((await unblock(SUPPORT_ADMIN)).status).toBe(200);
+    await blockIp(env, IP, 3);
+    roles.set(SUPPORT_ADMIN.address.toLowerCase(), 0);
+    expect((await unblock(SUPPORT_ADMIN)).status).toBe(404);
+  });
+});
+
+describe("the signature itself", () => {
+  let env: Env;
+
+  beforeEach(async () => {
+    ({ env } = fakeEnv());
+    await blockIp(env, IP, 3);
+  });
+
+  it("refuses an expired one", async () => {
+    const res = await admin(env, OWNER, { action: "unblock", ip: IP }, { expiry: nowSec() - 1 });
+    expect(res.status).toBe(404);
+    expect(await blockRecord(env, IP)).not.toBeNull();
+  });
+
+  it("refuses one valid for absurdly long", async () => {
+    // A signature good for a year is a bearer token wearing a timestamp.
+    const res = await admin(env, OWNER, { action: "unblock", ip: IP }, { expiry: nowSec() + 31_536_000 });
+    expect(res.status).toBe(404);
+  });
+
+  it("cannot be replayed against a DIFFERENT address", async () => {
+    // The signature covers the ip. Capturing an unblock for one address must
+    // not become an unblock for any address.
+    await blockIp(env, OTHER, 3);
+    const signed = await signAdmin(env, OWNER, { action: "unblock", ip: IP });
+
+    const res = await handleAdmin(
       new Request("https://w/api/admin/blocks", {
-        method: "DELETE",
-        headers: { "X-Admin-Secret": SECRET, "Content-Type": "application/json" },
-        body: JSON.stringify({ ip: IP }),
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...signed, ip: OTHER }),
       }),
       env
     );
+    expect(res.status).toBe(404);
+    expect(await blockRecord(env, OTHER)).not.toBeNull();
+  });
 
-    // They can pay again, and are not one claim from being blocked once more.
-    expect(await blockedForFalseClaims(env, IP)).toBeNull();
-    expect(((await (await lookup(IP)).json()) as any).strikes).toBe(0);
+  it("cannot be replayed as a DIFFERENT action", async () => {
+    const signed = await signAdmin(env, OWNER, { action: "lookup", ip: IP });
+    const res = await handleAdmin(
+      new Request("https://w/api/admin/blocks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...signed, action: "unblock" }),
+      }),
+      env
+    );
+    expect(res.status).toBe(404);
+    expect(await blockRecord(env, IP)).not.toBeNull();
+  });
+
+  it("cannot be replayed against a different integrator", async () => {
+    // The domain binds the verifying contract, so a signature from a testnet
+    // deployment is not a signature here.
+    const signed = await signAdmin(env, OWNER, { action: "unblock", ip: IP }, {
+      integrator: "0x9999999999999999999999999999999999999999",
+    });
+    const res = await handleAdmin(
+      new Request("https://w/api/admin/blocks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(signed),
+      }),
+      env
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it("refuses a forged signature claiming to be the owner", async () => {
+    const signed = await signAdmin(env, STRANGER, { action: "unblock", ip: IP });
+    const res = await handleAdmin(
+      new Request("https://w/api/admin/blocks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...signed, signer: OWNER.address }),
+      }),
+      env
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it("answers 404 for every failure, never distinguishing them", async () => {
+    // A different status for "bad signature" and "no role" tells a prober which
+    // half to work on.
+    const cases = [
+      admin(env, STRANGER, { action: "unblock", ip: IP }),
+      admin(env, OWNER, { action: "unblock", ip: IP }, { expiry: nowSec() - 1 }),
+      admin(env, OWNER, { action: "nonsense", ip: IP }),
+    ];
+    for (const c of cases) expect((await c).status).toBe(404);
+  });
+
+  it("refuses when the chain cannot be read, rather than opening", async () => {
+    // An unreadable RPC must not become an open door on an endpoint that can
+    // lift a fraud block.
+    roleReadFails = true;
+    try {
+      expect((await admin(env, OWNER, { action: "unblock", ip: IP })).status).toBe(404);
+    } finally {
+      roleReadFails = false;
+    }
   });
 });
