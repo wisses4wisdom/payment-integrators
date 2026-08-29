@@ -31,7 +31,7 @@
  */
 
 import { encodeFunctionData, decodeEventLog, type Address, type Hex } from "viem";
-import { LINK_ROUTER_ABI, ACCOUNT_FACTORY_ABI, type Env } from "./config";
+import { LINK_ROUTER_ABI, accountFactory, type Env } from "./config";
 import { linkSigner, linkWalletAddress } from "./linkWallet";
 import { executeCall, sendUserOp, waitForUserOp, UserOpError } from "./aa";
 import { publicClientFor } from "./chain";
@@ -62,13 +62,14 @@ async function deployArgs(
 ): Promise<{ factory: Address; factoryData: Hex } | undefined> {
   const code = await publicClientFor(env).getCode({ address: account });
   if (code && code !== "0x") return undefined;
+  const { abi, salt } = accountFactory(env);
   return {
     factory: env.ACCOUNT_FACTORY_ADDRESS as Address,
     factoryData: encodeFunctionData({
-      abi: ACCOUNT_FACTORY_ABI,
+      abi,
       functionName: "createAccount",
-      args: [owner, 0n],
-    }),
+      args: [owner, salt],
+    } as never),
   };
 }
 

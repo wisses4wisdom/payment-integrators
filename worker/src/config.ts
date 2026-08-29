@@ -71,6 +71,17 @@ export interface Env {
    *  known before it exists and is deployed lazily on the first payment —
    *  a link nobody ever pays deploys nothing at all. */
   ACCOUNT_FACTORY_ADDRESS: string;
+  /**
+   * Which factory shape `ACCOUNT_FACTORY_ADDRESS` is.
+   *
+   * "thirdweb" — getAddress(address, bytes)   ← hosted accounts
+   * "simple"   — getAddress(address, uint256) ← the ERC-4337 reference factory
+   *
+   * The two have DIFFERENT SELECTORS, so the wrong one does not fail loudly; it
+   * calls a function the factory does not have. Defaults to "thirdweb" because
+   * that is what production uses, and the local suites set "simple" explicitly.
+   */
+  ACCOUNT_FACTORY_KIND?: string;
   /** Bundler RPC. This is what replaces the funded key AND the nonce
    *  manager: each link's account has its own nonce sequence, so one stuck
    *  payment cannot block every later one. */
@@ -730,13 +741,24 @@ export const SIMPLE_ACCOUNT_ABI = [
 ] as const;
 
 /**
- * The account factory.
+ * The account factory — and there are TWO shapes in the wild.
  *
- * `getAddress` is a VIEW: the address exists as a computation before any
- * account is deployed, which is what lets a merchant register a link's wallet
- * at creation time and lets a link nobody ever pays deploy nothing at all.
+ * The reference `SimpleAccountFactory` takes a uint256 salt:
+ *     getAddress(address owner, uint256 salt)
+ *
+ * thirdweb's `BaseAccountFactory` takes bytes:
+ *     getAddress(address adminSigner, bytes data)
+ *
+ * Different types mean different SELECTORS, so the wrong ABI does not fail
+ * loudly — it calls a function the factory does not have. This was shipped
+ * wrong once: the reference shape was used against a thirdweb factory, which
+ * works in every local test (where the reference factory is deployed) and fails
+ * only against production.
+ *
+ * `ACCOUNT_FACTORY_KIND` picks the shape. There is no default that silently
+ * guesses, because guessing is what caused the problem.
  */
-export const ACCOUNT_FACTORY_ABI = [
+export const SIMPLE_ACCOUNT_FACTORY_ABI = [
   {
     type: "function",
     name: "getAddress",
@@ -758,3 +780,43 @@ export const ACCOUNT_FACTORY_ABI = [
     outputs: [{ type: "address" }],
   },
 ] as const;
+
+export const THIRDWEB_ACCOUNT_FACTORY_ABI = [
+  {
+    type: "function",
+    name: "getAddress",
+    stateMutability: "view",
+    inputs: [
+      { name: "adminSigner", type: "address" },
+      { name: "data", type: "bytes" },
+    ],
+    outputs: [{ type: "address" }],
+  },
+  {
+    type: "function",
+    name: "createAccount",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "admin", type: "address" },
+      { name: "data", type: "bytes" },
+    ],
+    outputs: [{ type: "address" }],
+  },
+] as const;
+
+/** The factory ABI and salt argument for the configured kind. */
+export function accountFactory(env: Env) {
+  const kind = (env.ACCOUNT_FACTORY_KIND ?? "thirdweb").toLowerCase();
+  if (kind === "simple") {
+    return { abi: SIMPLE_ACCOUNT_FACTORY_ABI, salt: 0n as unknown as bigint | `0x${string}` };
+  }
+  if (kind === "thirdweb") {
+    // The account salt, as bytes. Empty means "one account per owner", which is
+    // what we want: the owner key is already unique per link.
+    return { abi: THIRDWEB_ACCOUNT_FACTORY_ABI, salt: "0x" as unknown as bigint | `0x${string}` };
+  }
+  throw new Error(`Unknown ACCOUNT_FACTORY_KIND: ${kind}`);
+}
+
+/** @deprecated Use `accountFactory(env)` — the shape depends on the factory. */
+export const ACCOUNT_FACTORY_ABI = SIMPLE_ACCOUNT_FACTORY_ABI;

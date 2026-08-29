@@ -221,6 +221,11 @@ export function makeTestEnv(a: Addresses, overrides: EnvOverrides = {}): Env {
     LINK_ROUTER_ADDRESS: a.router,
     ENTRYPOINT_ADDRESS: a.entryPoint,
     ACCOUNT_FACTORY_ADDRESS: a.accountFactory,
+    // The local fixture is the ERC-4337 REFERENCE factory, whose getAddress
+    // takes a uint256 salt. Production uses thirdweb's, which takes bytes.
+    // Stating it explicitly is the point: the two have different selectors, so
+    // a default that guessed would pass here and fail live.
+    ACCOUNT_FACTORY_KIND: "simple",
     // Only these two differ from production. Everything in `src/` runs
     // unchanged, so a packing or receipt-reading mistake fails here exactly the
     // way it would fail live.

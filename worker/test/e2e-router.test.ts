@@ -120,6 +120,9 @@ d("payment links without a relayer wallet — worker, end to end", () => {
       LINK_ROUTER_ADDRESS: A.router,
       ENTRYPOINT_ADDRESS: A.entryPoint,
       ACCOUNT_FACTORY_ADDRESS: A.accountFactory,
+      // The local fixture is the reference factory (uint256 salt), not
+      // thirdweb's (bytes). Different selectors, so this must be explicit.
+      ACCOUNT_FACTORY_KIND: "simple",
       // Same worker code; only these two differ from production.
       BUNDLER_URL: "http://local-bundler/rpc",
       PAYMASTER_URL: "http://local-bundler/rpc",

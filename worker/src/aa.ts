@@ -23,7 +23,7 @@
 
 import { encodeFunctionData, decodeEventLog, concat, pad, toHex, type Address, type Hex } from "viem";
 import { publicClientFor } from "./chain";
-import { ENTRYPOINT_ABI, SIMPLE_ACCOUNT_ABI, ACCOUNT_FACTORY_ABI, type Env } from "./config";
+import { ENTRYPOINT_ABI, SIMPLE_ACCOUNT_ABI, accountFactory, type Env } from "./config";
 
 /** ERC-4337 v0.7 packed user operation, as the bundler expects it on the wire. */
 export interface UserOp {
@@ -82,13 +82,13 @@ const bundlerHeaders = (env: Env): Record<string, string> =>
  * One view call is worth not having that class of bug.
  */
 export async function predictAccount(env: Env, owner: Address): Promise<Address> {
-  const client = publicClientFor(env);
-  return (await client.readContract({
+  const { abi, salt } = accountFactory(env);
+  return (await publicClientFor(env).readContract({
     address: env.ACCOUNT_FACTORY_ADDRESS as Address,
-    abi: ACCOUNT_FACTORY_ABI,
+    abi,
     functionName: "getAddress",
-    args: [owner, 0n],
-  })) as Address;
+    args: [owner, salt],
+  } as never)) as Address;
 }
 
 /** Wraps a call to the Router as the account's own `execute`. Value is always

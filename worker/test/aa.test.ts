@@ -1,8 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { decodeFunctionData } from "viem";
 import { executeCall, successFromLogs } from "../src/aa";
-import { SIMPLE_ACCOUNT_ABI, LINK_ROUTER_ABI, ENTRYPOINT_ABI } from "../src/config";
-import { encodeFunctionData, encodeEventTopics, encodeAbiParameters } from "viem";
+import { SIMPLE_ACCOUNT_ABI, LINK_ROUTER_ABI, ENTRYPOINT_ABI, accountFactory } from "../src/config";
+import { encodeFunctionData, encodeEventTopics, encodeAbiParameters, toFunctionSelector } from "viem";
 
 /**
  * The user-operation client.
@@ -131,5 +131,64 @@ describe("reading the outcome of an operation", () => {
       data: "0x" as `0x${string}`,
     };
     expect(successFromLogs([noise, userOpEventLog(true), noise])).toBe(true);
+  });
+});
+
+/**
+ * The account factory has TWO shapes in the wild, and picking the wrong one is
+ * silent.
+ *
+ * This suite exists because the wrong one shipped. The reference
+ * `SimpleAccountFactory` takes `(address, uint256)`; thirdweb's
+ * `BaseAccountFactory` takes `(address, bytes)`. Different types mean different
+ * SELECTORS — so the wrong ABI does not throw a type error or fail to encode,
+ * it calls a function the factory does not have.
+ *
+ * It passed every local test, because the local fixture IS the reference
+ * factory. It would have failed only against production.
+ */
+describe("which account factory we are talking to", () => {
+  const env = (kind?: string) => ({ ACCOUNT_FACTORY_KIND: kind }) as any;
+
+  it("gives the two factories DIFFERENT selectors — this is the whole trap", () => {
+    const simple = toFunctionSelector("getAddress(address,uint256)");
+    const thirdweb = toFunctionSelector("getAddress(address,bytes)");
+    expect(simple).not.toBe(thirdweb);
+  });
+
+  it("encodes createAccount for the reference factory as (address,uint256)", () => {
+    const { abi, salt } = accountFactory(env("simple"));
+    const data = encodeFunctionData({
+      abi,
+      functionName: "createAccount",
+      args: ["0x1111111111111111111111111111111111111111", salt],
+    } as never);
+    expect(data.slice(0, 10)).toBe(toFunctionSelector("createAccount(address,uint256)"));
+  });
+
+  it("encodes createAccount for thirdweb's factory as (address,bytes)", () => {
+    const { abi, salt } = accountFactory(env("thirdweb"));
+    const data = encodeFunctionData({
+      abi,
+      functionName: "createAccount",
+      args: ["0x1111111111111111111111111111111111111111", salt],
+    } as never);
+    expect(data.slice(0, 10)).toBe(toFunctionSelector("createAccount(address,bytes)"));
+  });
+
+  it("defaults to thirdweb, because that is what production runs", () => {
+    const { abi } = accountFactory(env(undefined));
+    const data = encodeFunctionData({
+      abi,
+      functionName: "getAddress",
+      args: ["0x1111111111111111111111111111111111111111", "0x"],
+    } as never);
+    expect(data.slice(0, 10)).toBe(toFunctionSelector("getAddress(address,bytes)"));
+  });
+
+  it("refuses an unknown kind rather than guessing", () => {
+    // A wrong guess here is invisible until production, so there is no default
+    // worth falling back to.
+    expect(() => accountFactory(env("nonsense"))).toThrow(/ACCOUNT_FACTORY_KIND/);
   });
 });

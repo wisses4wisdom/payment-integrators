@@ -33,6 +33,29 @@ DIAMOND_ADDRESS = "0x0000000000000000000000000000000000000000"
 # path, and its only reach into custody code is three link calls.
 LINK_ROUTER_ADDRESS = "0x0000000000000000000000000000000000000000"  # set after deploy
 
+# ─── Account abstraction ──────────────────────────────────────────────
+# The ERC-4337 EntryPoint. Already deployed on Base; do not deploy your own.
+ENTRYPOINT_ADDRESS = "0x0000000000071727De22E5E9d8BAf0edAc6f37da"
+
+# The account factory, and WHICH SHAPE it is.
+#
+# There are two in the wild and they have DIFFERENT SELECTORS:
+#   "thirdweb" -> getAddress(address, bytes)    ← hosted accounts
+#   "simple"   -> getAddress(address, uint256)  ← the 4337 reference factory
+#
+# The wrong value does not fail loudly. It calls a function the factory does
+# not have, and every local test still passes because the local fixture is the
+# reference factory. This shipped wrong once; hence the explicit setting.
+ACCOUNT_FACTORY_ADDRESS = "0x0000000000000000000000000000000000000000"  # set from your project
+ACCOUNT_FACTORY_KIND = "thirdweb"
+
+# Bundler and sponsorship. These replace the funded relayer AND the nonce
+# manager: each link account has its own nonce sequence, so one stuck payment
+# cannot block every later one.
+BUNDLER_URL = ""   # e.g. https://<chain>.bundler.thirdweb.com/v2/<clientId>
+PAYMASTER_URL = "" # usually the same endpoint
+PAYMASTER_POLICY_ID = ""
+
 # Sponsored operations allowed per link, over that link's whole life.
 #
 # This is NOT a provider dashboard setting. The built-in sponsorship rules
@@ -170,6 +193,29 @@ DIAMOND_ADDRESS = "0x0000000000000000000000000000000000000000"
 # payment goes through it. It holds nothing, has no admin and no upgrade
 # path, and its only reach into custody code is three link calls.
 LINK_ROUTER_ADDRESS = "0x0000000000000000000000000000000000000000"  # set after deploy
+
+# ─── Account abstraction ──────────────────────────────────────────────
+# The ERC-4337 EntryPoint. Already deployed on Base; do not deploy your own.
+ENTRYPOINT_ADDRESS = "0x0000000000071727De22E5E9d8BAf0edAc6f37da"
+
+# The account factory, and WHICH SHAPE it is.
+#
+# There are two in the wild and they have DIFFERENT SELECTORS:
+#   "thirdweb" -> getAddress(address, bytes)    ← hosted accounts
+#   "simple"   -> getAddress(address, uint256)  ← the 4337 reference factory
+#
+# The wrong value does not fail loudly. It calls a function the factory does
+# not have, and every local test still passes because the local fixture is the
+# reference factory. This shipped wrong once; hence the explicit setting.
+ACCOUNT_FACTORY_ADDRESS = "0x0000000000000000000000000000000000000000"  # set from your project
+ACCOUNT_FACTORY_KIND = "thirdweb"
+
+# Bundler and sponsorship. These replace the funded relayer AND the nonce
+# manager: each link account has its own nonce sequence, so one stuck payment
+# cannot block every later one.
+BUNDLER_URL = ""   # e.g. https://<chain>.bundler.thirdweb.com/v2/<clientId>
+PAYMASTER_URL = "" # usually the same endpoint
+PAYMASTER_POLICY_ID = ""
 
 # Sponsored operations allowed per link, over that link's whole life.
 #
