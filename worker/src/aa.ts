@@ -21,7 +21,7 @@
  * a refused payment be reported to a customer as accepted.
  */
 
-import { encodeFunctionData, decodeEventLog, type Address, type Hex } from "viem";
+import { encodeFunctionData, decodeEventLog, concat, pad, toHex, type Address, type Hex } from "viem";
 import { publicClientFor } from "./chain";
 import { ENTRYPOINT_ABI, SIMPLE_ACCOUNT_ABI, ACCOUNT_FACTORY_ABI, type Env } from "./config";
 
@@ -249,11 +249,13 @@ export async function sendUserOp(
  * hashing the wrong one produces a signature the account rejects with no useful
  * error.
  */
-function toPacked(op: UserOp, _env: Env) {
-  const pack = (hi: Hex, lo: Hex) =>
-    ("0x" +
-      BigInt(hi).toString(16).padStart(32, "0") +
-      BigInt(lo).toString(16).padStart(32, "0")) as Hex;
+export function toPacked(op: UserOp, _env?: Env) {
+  // `pad` THROWS when a value does not fit; hand-rolling this with
+  // `padStart(32, "0")` does not — an oversized value silently produces a
+  // longer string, the fields shift, and the account rejects the signature with
+  // no indication of why. A loud failure is worth more than a clever one here.
+  const pack = (hi: Hex, lo: Hex): Hex =>
+    concat([pad(toHex(BigInt(hi)), { size: 16 }), pad(toHex(BigInt(lo)), { size: 16 })]);
 
   return {
     sender: op.sender,
@@ -264,10 +266,12 @@ function toPacked(op: UserOp, _env: Env) {
     preVerificationGas: BigInt(op.preVerificationGas),
     gasFees: pack(op.maxPriorityFeePerGas, op.maxFeePerGas),
     paymasterAndData: op.paymaster
-      ? ((op.paymaster +
-          BigInt(op.paymasterVerificationGasLimit ?? "0x0").toString(16).padStart(32, "0") +
-          BigInt(op.paymasterPostOpGasLimit ?? "0x0").toString(16).padStart(32, "0") +
-          (op.paymasterData ?? "0x").slice(2)) as Hex)
+      ? concat([
+          op.paymaster,
+          pad(toHex(BigInt(op.paymasterVerificationGasLimit ?? "0x0")), { size: 16 }),
+          pad(toHex(BigInt(op.paymasterPostOpGasLimit ?? "0x0")), { size: 16 }),
+          (op.paymasterData ?? "0x") as Hex,
+        ])
       : ("0x" as Hex),
     signature: op.signature,
   };
