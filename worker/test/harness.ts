@@ -30,6 +30,8 @@ export interface Addresses {
   router: string;
   entryPoint: string;
   accountFactory: string;
+  /** Accounts that also implement ERC-1271, as hosted accounts do. */
+  account1271Factory: string;
   paymaster: string;
   sponsorKey: string;
   bundlerKey: string;

@@ -15,7 +15,8 @@ import {
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { handlePay } from "../src/pay";
-import { createLinkWallet } from "../src/linkWallet";
+import { createLinkWallet, linkSigner } from "../src/linkWallet";
+import { handleProvisionWallet } from "../src/provision";
 import { predictAccount, sendUserOp, waitForUserOp, executeCall } from "../src/aa";
 import { makeTestEnv, useLocalBundler, CUSTOMER_PUBKEY, type Addresses } from "./harness";
 import { LINK_ROUTER_ABI, ACCOUNT_FACTORY_ABI, type Env } from "../src/config";
@@ -145,7 +146,10 @@ describe.skipIf(!HAVE)("the merchant as a smart account, as in production", () =
     });
     pub = createPublicClient({ chain, transport: http(A.rpcUrl) });
 
-    env = makeTestEnv(A);
+    // The merchant account must be able to SIGN, not only send — see
+    // Account1271.sol. Everything else about the fixture is unchanged, and the
+    // factory shape is identical, so nothing in src/ special-cases this.
+    env = { ...makeTestEnv(A), ACCOUNT_FACTORY_ADDRESS: A.account1271Factory } as Env;
     bundlerHandle = useLocalBundler(A);
 
     // A fresh owner key, so this merchant is nobody the other suites touched.
@@ -177,7 +181,7 @@ describe.skipIf(!HAVE)("the merchant as a smart account, as in production", () =
       callData,
       deploy: deploy
         ? {
-            factory: A.accountFactory as Address,
+            factory: A.account1271Factory as Address,
             factoryData: encodeFunctionData({
               abi: ACCOUNT_FACTORY_ABI,
               functionName: "createAccount",
@@ -354,4 +358,156 @@ describe.skipIf(!HAVE)("the merchant as a smart account, as in production", () =
     })();
     expect(outcome.success).toBe(true);
   }, 180_000);
+
+  // ─── B1: the production path, with nothing stubbed ────────────────
+
+  describe("provisioning through the real endpoint", () => {
+    /**
+     * This is the case round-3 B1 was about, driven the way production will.
+     *
+     * Every other test in this file mints the wallet by calling
+     * `createLinkWallet` directly — which is exactly how the missing endpoint
+     * went unnoticed: the tests supplied the one thing production never did. So
+     * nothing is stubbed here. The merchant signs, the HTTP handler runs, and
+     * the address it returns is the one batched on-chain.
+     */
+    /**
+     * @param who the key that signs
+     * @param as  the address the signature is checked AGAINST — the merchant's
+     *            ACCOUNT, which is what is registered on-chain. Passing the
+     *            owner key here instead is the bug this suite exists to catch.
+     */
+    async function provision(
+      linkId: Hex,
+      who = merchantKey,
+      expiry?: number,
+      as: Address = merchantAccount
+    ) {
+      const exp = expiry ?? Math.floor(Date.now() / 1000) + 120;
+      const signature = await who.signTypedData({
+        domain: {
+          name: "P2P Merchant Terminal Admin",
+          version: "1",
+          chainId: A.chainId,
+          verifyingContract: A.integrator as Address,
+        },
+        types: {
+          LinkWallet: [
+            { name: "linkId", type: "bytes32" },
+            { name: "expiry", type: "uint256" },
+          ],
+        },
+        primaryType: "LinkWallet",
+        message: { linkId, expiry: BigInt(exp) },
+      });
+
+      return handleProvisionWallet(
+        new Request(`https://w/api/links/${linkId}/wallet`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          // `signer` is the ACCOUNT. The endpoint asks it, via ERC-1271,
+          // whether this signature is its own.
+          body: JSON.stringify({ signer: as, signature, expiry: exp }),
+        }),
+        env,
+        linkId
+      );
+    }
+
+    it("mints, batches and pays — with the endpoint doing the minting", async () => {
+      const id = linkId();
+
+      // 1. The merchant asks for a wallet. The link does not exist yet, which
+      //    is the normal case: the address is needed to build the batch.
+      const res = await provision(id);
+      const body = (await res.json()) as any;
+      expect(res.status, `provision failed: ${body.error}`).toBe(200);
+      const account = body.account as Address;
+
+      // The key the payment path will unwrap is now really there.
+      expect(await linkSigner(env, id)).not.toBeNull();
+
+      // 2. createLink BEFORE registerAgent, in one operation.
+      const outcome = await runOp(
+        encodeFunctionData({
+          abi: BATCH_ABI,
+          functionName: "executeBatch",
+          args: [
+            [A.integrator as Address, A.router as Address],
+            [0n, 0n],
+            [
+              encodeFunctionData({
+                abi: MERCHANT_ABI,
+                functionName: "createLink",
+                args: [id, AMOUNT, INR, 0n, 3, "0x"],
+              }),
+              encodeFunctionData({
+                abi: LINK_ROUTER_ABI,
+                functionName: "registerAgent",
+                args: [id, account],
+              }),
+            ],
+          ],
+        })
+      );
+      expect(outcome.success).toBe(true);
+
+      // The Router holds the address the ENDPOINT returned, not one a test
+      // invented.
+      expect(
+        await pub.readContract({
+          address: A.router as Address,
+          abi: LINK_ROUTER_ABI,
+          functionName: "linkAgent",
+          args: [id],
+        })
+      ).toBe(account);
+
+      // 3. A customer pays it.
+      const pay = await handlePay(payReq("198.22.0.1"), env, id);
+      const paid = (await pay.json()) as any;
+      expect(pay.status, `pay failed: ${paid.error}`).toBe(200);
+      expect(paid.orderId).toBeTruthy();
+    }, 180_000);
+
+    it("a retry returns the SAME address, so the batch stays valid", async () => {
+      // registerAgent is write-once. A retry after a dropped response that
+      // handed back a fresh address would strand the link permanently.
+      const id = linkId();
+      const first = (await (await provision(id)).json()) as any;
+      const second = (await (await provision(id)).json()) as any;
+
+      expect(second.account).toBe(first.account);
+      expect(second.existing).toBe(true);
+    }, 180_000);
+
+    it("refuses a wallet that is not a registered merchant", async () => {
+      const id = linkId();
+      const strangerKey = privateKeyToAccount(keccak256(toHex(`${RUN}:stranger`)) as Hex);
+      const strangerAccount = await predictAccount(env, strangerKey.address);
+      expect((await provision(id, strangerKey, undefined, strangerAccount)).status).toBe(403);
+      expect(await linkSigner(env, id)).toBeNull();
+    }, 180_000);
+
+    it("without provisioning, the link is unpayable — B1, reproduced", async () => {
+      // The state a real deployment was in: a link created correctly, with no
+      // wallet behind it, because nothing ever minted one.
+      const id = linkId();
+      await runOp(
+        executeCall(
+          A.integrator as Address,
+          encodeFunctionData({
+            abi: MERCHANT_ABI,
+            functionName: "createLink",
+            args: [id, AMOUNT, INR, 0n, 3, "0x"],
+          })
+        )
+      );
+
+      const res = await handlePay(payReq("198.22.0.2"), env, id);
+      expect(res.status).toBeGreaterThanOrEqual(400);
+      const body = (await res.json()) as any;
+      expect(String(body.error)).toMatch(/no longer active|could not/i);
+    }, 180_000);
+  });
 });

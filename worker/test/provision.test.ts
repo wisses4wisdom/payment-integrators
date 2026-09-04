@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { webcrypto } from "node:crypto";
 import { privateKeyToAccount } from "viem/accounts";
+import { verifyTypedData } from "viem";
 import { handleProvisionWallet } from "../src/provision";
 import { linkWalletAddress, linkSigner, mintedBy } from "../src/linkWallet";
 import type { Env } from "../src/config";
@@ -43,10 +44,18 @@ let registered = new Set<string>();
 let frozen = new Set<string>();
 /** linkId -> owner, or absent to model a link that does not exist yet. */
 let links = new Map<string, string>();
+/** Set to fail the chain reads, for the RPC-outage cases. */
+let rpcDown = false;
 
 vi.mock("../src/chain", () => ({
   publicClientFor: () => ({
+    // REAL signature verification — only the chain reads are stubbed. In
+    // production this is the public client, which additionally asks a smart
+    // account via ERC-1271; here every signer is an EOA, so plain recovery is
+    // the same answer.
+    verifyTypedData: async (a: any) => verifyTypedData(a),
     readContract: async ({ functionName, args }: any) => {
+      if (rpcDown) throw new Error("rpc unreachable");
       if (functionName === "getLink") {
         const owner = links.get(String(args[0]).toLowerCase());
         // The integrator reverts LinkNotFound for a link that does not exist,
@@ -76,6 +85,7 @@ function fakeEnv(): { env: Env; store: Map<string, string> } {
   registered = new Set([MERCHANT.address.toLowerCase(), OTHER_MERCHANT.address.toLowerCase()]);
   frozen = new Set();
   links = new Map();
+  rpcDown = false;
 
   const store = new Map<string, string>();
   const env = {
@@ -209,6 +219,38 @@ describe("minting a link's wallet", () => {
     const res = await provision(env, OTHER_MERCHANT);
     expect(res.status).toBe(409);
     expect(await mintedBy(env, LINK)).toBe(MERCHANT.address);
+  });
+
+  it("refuses a FROZEN merchant even on a link they already own", async () => {
+    // The frozen check used to run only on the not-yet-created path, so a
+    // merchant frozen AFTER creating a link could still mint for it — and
+    // frozen merchants cannot take payments, so the wallet only fails later.
+    links.set(LINK.toLowerCase(), MERCHANT.address);
+    frozen.add(MERCHANT.address.toLowerCase());
+    expect((await provision(env, MERCHANT)).status).toBe(403);
+  });
+
+  it("refuses everything when the chain is unreadable", async () => {
+    // An earlier version caught the getLink failure and fell through to the
+    // weaker "is a registered merchant" check — so an RPC blip on someone
+    // else's EXISTING link let a different merchant mint for it. They could not
+    // registerAgent, but they occupied the record and the real owner's link id
+    // was dead. An outage must not widen who may mint.
+    rpcDown = true;
+    expect((await provision(env, MERCHANT)).status).toBe(403);
+    expect(await linkSigner(env, LINK)).toBeNull();
+  });
+
+  it("does not let an RPC blip hand someone else's link to another merchant", async () => {
+    // The concrete shape of the bug above.
+    links.set(LINK.toLowerCase(), OTHER_MERCHANT.address);
+    rpcDown = true;
+    expect((await provision(env, MERCHANT)).status).toBe(403);
+
+    // And with the chain readable, ownership is enforced as it should be.
+    rpcDown = false;
+    expect((await provision(env, MERCHANT)).status).toBe(403);
+    expect((await provision(env, OTHER_MERCHANT)).status).toBe(200);
   });
 
   // ─── The signature ────────────────────────────────────────────────

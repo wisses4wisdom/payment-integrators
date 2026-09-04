@@ -23,18 +23,16 @@
  *
  * WHY THE ADDRESS IS MINTED BEFORE THE LINK EXISTS
  * Because the batch needs it before it is signed. That means ownership cannot
- * be checked against `link.owner` — the link is not there yet. So authorisation
- * is the strongest thing available at each moment:
+ * be checked against `link.owner` — the link is not there yet. So:
  *
- *   • link does not exist yet  →  the signer must be a REGISTERED MERCHANT
- *   • link already exists      →  the signer must be its OWNER
+ *   • the signer must ALWAYS be a registered, non-frozen merchant
+ *   • AND, if the link already exists, its owner
  *
- * The second case covers retries and the merchant app recovering from a half
- * completed flow, and it is strictly stronger, so it is preferred when
- * available.
+ * Both, not either. See `authorise` for why the order of those two reads
+ * matters more than it looks.
  */
 
-import { verifyTypedData, type Address, type Hex } from "viem";
+import { type Address, type Hex } from "viem";
 import { publicClientFor } from "./chain";
 import { INTEGRATOR_ABI, type Env } from "./config";
 import { createLinkWallet, linkWalletAddress, keyTtlFor, mintedBy } from "./linkWallet";
@@ -72,6 +70,19 @@ const MERCHANT_INFO_ABI = [
  * The linkId is inside the signature. Without it a captured signature would
  * mint a wallet for any link the holder named — and since the address is what
  * gets bound on-chain, that is the whole authorisation.
+ *
+ * `signer` IS THE MERCHANT ACCOUNT, NOT THE KEY THAT SIGNED
+ * In production the merchant is a smart account: a social login controls an
+ * owner key, but the address registered as a merchant, and recorded as
+ * `link.owner`, is the ACCOUNT. Recovering the signature to an EOA and looking
+ * that up finds no merchant, so every real merchant is refused — which is
+ * exactly what happened, and only surfaced once a test used a smart account
+ * instead of an EOA.
+ *
+ * So verification goes through the PUBLIC CLIENT rather than the standalone
+ * helper. For a contract it asks the account itself, via ERC-1271; for an EOA
+ * it does ordinary recovery. Both shapes work, and the address checked is the
+ * one the contract will actually compare against.
  */
 async function verifyMerchant(
   env: Env,
@@ -85,7 +96,7 @@ async function verifyMerchant(
   if (expiry <= now || expiry > now + PROVISION_WINDOW_SECONDS) return null;
 
   try {
-    const ok = await verifyTypedData({
+    const ok = await publicClientFor(env).verifyTypedData({
       address: signer as Address,
       // Bound to this chain and this integrator, so a signature from a testnet
       // deployment is not a signature here.
@@ -114,9 +125,27 @@ async function verifyMerchant(
 /**
  * Is this signer allowed to mint a wallet for this link?
  *
- * Returns the link's expiry when allowed (needed to size the key's lifetime),
- * or null. A frozen merchant is refused: they cannot take payments, so issuing
- * them a link wallet only creates something that fails later.
+ * Two checks, in this order, and the order is the point:
+ *
+ *   1. The signer must be a REGISTERED, NON-FROZEN merchant. Always. A frozen
+ *      merchant cannot take payments, so minting them a wallet only creates
+ *      something that fails later, after a customer has engaged with it.
+ *
+ *   2. If the link ALREADY exists, the signer must be its owner.
+ *
+ * Doing the merchant read FIRST also settles a question the naive version got
+ * wrong. `getLink` reverts `LinkNotFound` for a link that does not exist yet —
+ * the normal case here, since the address is needed before the batch — but it
+ * also throws when the RPC is simply unreachable. An earlier version caught
+ * both and fell through to the weaker check, so an RPC blip on someone else's
+ * existing link let a different merchant mint for it. They could not then
+ * `registerAgent` (the Router checks the owner), but they occupied the record,
+ * and the real owner's link id was dead.
+ *
+ * A successful merchant read proves the RPC is answering. Only then is a
+ * `getLink` failure attributable to the link not existing.
+ *
+ * Returns the link's expiry when allowed, since that sizes the key's lifetime.
  */
 async function authorise(
   env: Env,
@@ -125,23 +154,8 @@ async function authorise(
 ): Promise<{ ok: true; expiresAt: bigint } | { ok: false }> {
   const client = publicClientFor(env);
 
-  // Preferred: the link already exists, so ownership is unambiguous.
-  try {
-    const link = (await client.readContract({
-      address: env.INTEGRATOR_ADDRESS as Address,
-      abi: INTEGRATOR_ABI,
-      functionName: "getLink",
-      args: [linkId as Hex],
-    })) as readonly [Address, bigint, Hex, bigint, number, number, number, number];
-
-    if (link[0].toLowerCase() !== signer.toLowerCase()) return { ok: false };
-    return { ok: true, expiresAt: link[3] };
-  } catch {
-    // `getLink` reverts LinkNotFound when the link is not created yet, which is
-    // the NORMAL case: the merchant mints the wallet in order to batch
-    // createLink with registerAgent. Fall through to the weaker check.
-  }
-
+  // 1 ── Merchant status. This read also proves the RPC is answering, which is
+  //      what makes the getLink failure below interpretable.
   try {
     const info = (await client.readContract({
       address: env.INTEGRATOR_ADDRESS as Address,
@@ -153,12 +167,32 @@ async function authorise(
     const registered = info[3];
     const frozen = info[4];
     if (!registered || frozen) return { ok: false };
-    // The link does not exist, so its expiry is unknown. Treat it as
-    // never-expiring: the key then lives as long as any link could, and
-    // `createLinkWallet` records the actual expiry on a later re-read if needed.
-    return { ok: true, expiresAt: 0n };
   } catch {
+    // Unreadable chain. Refuse rather than fall back to something weaker — an
+    // RPC outage must not widen who may mint.
     return { ok: false };
+  }
+
+  // 2 ── Ownership, when there is a link to own.
+  try {
+    const link = (await client.readContract({
+      address: env.INTEGRATOR_ADDRESS as Address,
+      abi: INTEGRATOR_ABI,
+      functionName: "getLink",
+      args: [linkId as Hex],
+    })) as readonly [Address, bigint, Hex, bigint, number, number, number, number];
+
+    if (link[0].toLowerCase() !== signer.toLowerCase()) return { ok: false };
+    return { ok: true, expiresAt: link[3] };
+  } catch {
+    // The RPC answered a moment ago, so this is LinkNotFound: the link has not
+    // been created yet, which is exactly why the merchant is here.
+    //
+    // Its expiry is therefore unknown and the key is created without one. That
+    // is deliberate — a key that outlived its link would strand it forever,
+    // since `registerAgent` is write-once (see `keyTtlFor`). The cost is a
+    // record that outlives a short-lived link; revoking the link deletes it.
+    return { ok: true, expiresAt: 0n };
   }
 }
 
