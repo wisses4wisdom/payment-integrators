@@ -12,7 +12,13 @@ import type { Env } from "./config";
 import { publicClientFor } from "./chain";
 import { handlePay } from "./pay";
 import { handleRelayTx } from "./relayTx";
-import { handleRegisterWebhook, scanAndQueue, deliverQueued, sweepFalseClaims } from "./webhooks";
+import {
+  handleRegisterWebhook,
+  handleRegisterMerchantWebhook,
+  scanAndQueue,
+  deliverQueued,
+  sweepFalseClaims,
+} from "./webhooks";
 import { json, corsHeaders } from "./http";
 import { turnstileEnabled } from "./turnstile";
 import { handleSponsorCheck } from "./sponsor";
@@ -49,6 +55,10 @@ export default {
         env,
         path.slice("/api/links/".length, -"/wallet".length)
       );
+    } else if (req.method === "POST" && path === "/api/merchants/webhook") {
+      // One callback for every link a merchant owns. The per-link route still
+      // wins where both are set.
+      res = await handleRegisterMerchantWebhook(req, env);
     } else if (req.method === "POST" && path === "/api/links") {
       res = await handleRegisterWebhook(req, env);
     } else if (path === "/api/admin/blocks") {

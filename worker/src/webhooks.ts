@@ -13,14 +13,7 @@
  * the HMAC signature is what authenticates delivery.
  */
 
-import {
-  decodeEventLog,
-  hashMessage,
-  recoverAddress,
-  type Address,
-  type Hex,
-  type PublicClient,
-} from "viem";
+import { decodeEventLog, type Address, type Hex, type PublicClient } from "viem";
 import { INTEGRATOR_ABI, limitsFor, type Env } from "./config";
 import { publicClientFor } from "./chain";
 import { json, badRequest, clientIp } from "./http";
@@ -101,14 +94,6 @@ export async function handleRegisterWebhook(req: Request, env: Env): Promise<Res
     return badRequest("That webhook URL points back at this service.");
   }
 
-  // A webhook pointing back at this Worker turns delivery into a loop: the
-  // merchant's own retry schedule quietly spends their rate limit and the
-  // shared gas float. Self-inflicted, but nothing else here would stop it, and
-  // there is no legitimate reason to register our own origin as a callback.
-  if (isSelfTarget(parsed, req)) {
-    return badRequest("That webhook URL points back at this service.");
-  }
-
   // Unmetered before this point it was a free KV-write amplifier.
   const limited = await checkRateLimits(env, `hook:${linkId}`, clientIp(req));
   if (limited) return json({ error: limited }, 429);
@@ -136,10 +121,22 @@ export async function handleRegisterWebhook(req: Request, env: Env): Promise<Res
     env.INTEGRATOR_ADDRESS
   );
 
-  let recovered: Address;
+  // Verified AGAINST THE OWNER, not recovered to an address and compared.
+  //
+  // `recoverAddress` only understands EOAs. In production the merchant is a
+  // smart account: a social login controls an owner key, but the address stored
+  // as `link.owner` is the ACCOUNT. Recovering gave the key, the comparison
+  // failed, and no real merchant could register a webhook at all — the same
+  // shape of bug the provisioning endpoint had.
+  //
+  // `verifyMessage` on the public client asks a contract via ERC-1271 and does
+  // ordinary recovery for an EOA, so both shapes work and the address checked
+  // is the one the contract actually stores.
+  let valid = false;
   try {
-    recovered = await recoverAddress({
-      hash: hashMessage(message),
+    valid = await client.verifyMessage({
+      address: link[0],
+      message,
       signature: signature as Hex,
     });
   } catch {
@@ -148,13 +145,157 @@ export async function handleRegisterWebhook(req: Request, env: Env): Promise<Res
 
   // The CURRENT owner, every time — a link that changed hands does not keep
   // honouring the previous owner's signature.
-  if (recovered.toLowerCase() !== link[0].toLowerCase()) {
+  if (!valid) {
     return json({ error: "That signature is not from this link's owner." }, 403);
   }
 
   await env.KV.put(nonceKey, "1", { expirationTtl: 604_800 });
   await env.KV.put(`hook:${linkId}`, url);
   return json({ ok: true });
+}
+
+/**
+ * The message a MERCHANT signs to set a default webhook for all their links.
+ *
+ * Same shape as the per-link one, and for the same reasons: the chain id and
+ * integrator stop a testnet signature being replayed against mainnet, and the
+ * nonce stops it being replayed at all.
+ */
+export function merchantRegistrationMessage(
+  merchant: string,
+  url: string,
+  nonce: string,
+  chainId: number,
+  integrator: string
+): string {
+  return [
+    "PayQR merchant webhook registration",
+    `merchant: ${merchant.toLowerCase()}`,
+    `url: ${url}`,
+    `nonce: ${nonce}`,
+    `chain: ${chainId}`,
+    `integrator: ${integrator.toLowerCase()}`,
+  ].join("\n");
+}
+
+/**
+ * POST /api/merchants/webhook — one callback for every link you own.
+ *
+ * WHY THIS EXISTS ALONGSIDE THE PER-LINK ROUTE
+ * Registration was per LINK, so a merchant with five hundred links made five
+ * hundred signed calls, and any link they forgot silently delivered nothing.
+ * For the common case — "tell my backend whenever I am paid" — that is the
+ * wrong unit.
+ *
+ * The per-link route stays, and still WINS when both are set: a merchant
+ * running one link through a different system should not have to give up the
+ * default for everything else.
+ */
+export async function handleRegisterMerchantWebhook(req: Request, env: Env): Promise<Response> {
+  const body = (await req.json().catch(() => ({}))) as {
+    merchant?: string;
+    url?: string;
+    nonce?: string;
+    signature?: string;
+  };
+  const merchant = String(body.merchant ?? "");
+  const url = String(body.url ?? "");
+  const nonce = String(body.nonce ?? "");
+  const signature = String(body.signature ?? "");
+
+  if (!/^0x[0-9a-fA-F]{40}$/.test(merchant)) return badRequest("Invalid merchant.");
+  if (!/^0x[0-9a-fA-F]{130}$/.test(signature)) return badRequest("Invalid signature.");
+  if (nonce.length === 0 || nonce.length > 128) return badRequest("Invalid nonce.");
+
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return badRequest("Enter a valid webhook URL.");
+  }
+  if (parsed.protocol !== "https:") return badRequest("Webhook URLs must use HTTPS.");
+  if (isSelfTarget(parsed, req)) {
+    return badRequest("That webhook URL points back at this service.");
+  }
+
+  const limited = await checkRateLimits(env, `hook:m:${merchant.toLowerCase()}`, clientIp(req));
+  if (limited) return json({ error: limited }, 429);
+
+  const nonceKey = `hook:mnonce:${merchant.toLowerCase()}:${nonce}`;
+  if (await env.KV.get(nonceKey)) return json({ error: "This request was already used." }, 409);
+
+  const client = publicClientFor(env);
+
+  // Must be a registered merchant. Anyone can name any address, so without this
+  // the endpoint is a free KV write against an arbitrary key.
+  const info = (await client
+    .readContract({
+      address: env.INTEGRATOR_ADDRESS as Address,
+      abi: MERCHANT_INFO_ABI,
+      functionName: "getMerchantInfo",
+      args: [merchant as Address],
+    })
+    .catch(() => null)) as readonly [Hex, string, Hex, boolean, boolean] | null;
+  if (!info || !info[3]) return json({ error: "Not a registered merchant." }, 404);
+
+  const message = merchantRegistrationMessage(
+    merchant,
+    url,
+    nonce,
+    client.chain?.id ?? 0,
+    env.INTEGRATOR_ADDRESS
+  );
+
+  // ERC-1271 aware, because the merchant is a smart account — see the per-link
+  // route for what recovering to an EOA instead cost us.
+  let valid = false;
+  try {
+    valid = await client.verifyMessage({
+      address: merchant as Address,
+      message,
+      signature: signature as Hex,
+    });
+  } catch {
+    return badRequest("Invalid signature.");
+  }
+  if (!valid) return json({ error: "That signature is not from this merchant." }, 403);
+
+  await env.KV.put(nonceKey, "1", { expirationTtl: 604_800 });
+  await env.KV.put(`hook:merchant:${merchant.toLowerCase()}`, url);
+  return json({ ok: true, merchant, scope: "all links" });
+}
+
+const MERCHANT_INFO_ABI = [
+  {
+    type: "function",
+    name: "getMerchantInfo",
+    stateMutability: "view",
+    inputs: [{ name: "merchant", type: "address" }],
+    outputs: [
+      { name: "encPayoutId", type: "bytes" },
+      { name: "shopName", type: "string" },
+      { name: "currency", type: "bytes32" },
+      { name: "isRegistered", type: "bool" },
+      { name: "isFrozen", type: "bool" },
+    ],
+  },
+] as const;
+
+/**
+ * Where a notification for this link should go.
+ *
+ * The link's own URL wins, so a merchant can route one link somewhere else
+ * without losing the default for everything else.
+ */
+export async function webhookUrlFor(
+  env: Env,
+  linkId: string,
+  merchant: string
+): Promise<string | null> {
+  return (
+    (await env.KV.get(`hook:${linkId}`)) ??
+    (await env.KV.get(`hook:merchant:${merchant.toLowerCase()}`))
+  );
 }
 
 /**
@@ -250,67 +391,123 @@ export async function scanAndQueue(env: Env): Promise<number> {
   const span = limitsFor(env).logScanBlocks;
   const to = from + span > latest ? latest : from + span;
 
-  // Filter to OrderCompleted at the node rather than pulling every event the
-  // integrator emits and discarding most of them — this contract is chatty,
-  // and an unfiltered range query is the thing that starts timing out first
-  // under real volume.
-  const completedEvent = INTEGRATOR_ABI.find(
-    (e) => e.type === "event" && e.name === "OrderCompleted"
-  ) as Extract<(typeof INTEGRATOR_ABI)[number], { type: "event" }>;
-
-  const logs = await client.getLogs({
-    address: env.INTEGRATOR_ADDRESS as Address,
-    event: completedEvent,
-    fromBlock: from,
-    toBlock: to,
-  });
+  // Filter at the node rather than pulling every event the integrator emits and
+  // discarding most of them — this contract is chatty, and an unfiltered range
+  // query is the thing that starts timing out first under real volume.
+  const wanted = INTEGRATOR_ABI.filter(
+    (e) =>
+      e.type === "event" &&
+      (e.name === "OrderCompleted" || e.name === "OrderCancelled" || e.name === "LinkOrderPlaced")
+  ) as Extract<(typeof INTEGRATOR_ABI)[number], { type: "event" }>[];
 
   let queued = 0;
-  for (const log of logs) {
-    let ev;
-    try {
-      ev = decodeEventLog({
-        abi: INTEGRATOR_ABI,
-        data: log.data,
-        topics: log.topics as [Hex, ...Hex[]],
-      });
-    } catch {
-      continue;
-    }
-    if (ev.eventName !== "OrderCompleted") continue;
-
-    const { orderId, merchant, amount } = ev.args as unknown as {
-      orderId: bigint;
-      merchant: Address;
-      amount: bigint;
-    };
-
-    // Only link orders — a POS sale has no link at all.
-    //
-    // The KV record is written after the receipt lands, so a slow confirmation
-    // (the 202 path) never writes it: the customer pays, the LP completes, and
-    // the merchant's notification is silently dropped for the one order that
-    // took longest. The binding is on-chain regardless, so fall back to it.
-    const linkId = await linkIdFor(env, client, orderId);
-    if (!linkId) continue;
-
-    if (await env.KV.get(`hook:sent:${orderId}`)) continue;
-    const url = await env.KV.get(`hook:${linkId}`);
-    if (!url) continue;
-
-    const payload = JSON.stringify({
-      event: "payment.completed",
-      linkId,
-      orderId: orderId.toString(),
-      merchant,
-      amount: amount.toString(),
-      txHash: log.transactionHash,
-      at: new Date().toISOString(),
+  for (const eventAbi of wanted) {
+    const logs = await client.getLogs({
+      address: env.INTEGRATOR_ADDRESS as Address,
+      event: eventAbi,
+      fromBlock: from,
+      toBlock: to,
     });
 
-    const item: Pending = { url, payload, attempt: 0, nextAt: Date.now() };
-    await env.KV.put(`hook:q:${orderId}`, JSON.stringify(item), { expirationTtl: 172_800 });
-    queued++;
+    for (const log of logs) {
+      let ev;
+      try {
+        ev = decodeEventLog({
+          abi: INTEGRATOR_ABI,
+          data: log.data,
+          topics: log.topics as [Hex, ...Hex[]],
+        });
+      } catch {
+        continue;
+      }
+
+      const a = ev.args as Record<string, unknown>;
+      let event: string;
+      let orderId: bigint;
+      let merchant: Address;
+      let amount: bigint | undefined;
+      let linkId: string | null = null;
+
+      if (ev.eventName === "OrderCompleted") {
+        // The only one that means MONEY MOVED: the LP confirmed real fiat and
+        // USDC settled. Safe to hang an activation or a token transfer off.
+        event = "payment.completed";
+        orderId = a.orderId as bigint;
+        merchant = a.merchant as Address;
+        amount = a.amount as bigint;
+      } else if (ev.eventName === "OrderCancelled") {
+        // Abandoned or expired. What a builder needs to release a held seat or
+        // clear a pending row — without it they can only guess from silence.
+        event = "payment.cancelled";
+        orderId = a.orderId as bigint;
+        merchant = a.merchant as Address;
+      } else if (ev.eventName === "LinkOrderPlaced") {
+        // A customer started paying. NOT money — deliberately a separate event
+        // from completed, because acting on this one is how a merchant ships
+        // goods for a payment that never arrives.
+        event = "payment.placed";
+        orderId = a.orderId as bigint;
+        merchant = a.merchant as Address;
+        amount = a.amount as bigint;
+        linkId = String(a.linkId);
+
+        // Remember the binding NOW, because it will not survive.
+        //
+        // `onOrderComplete` and `onOrderCancel` both `delete orderToLink[orderId]`
+        // in the same transaction that emits their event. So by the time this
+        // scan sees OrderCompleted, the on-chain binding `linkIdFor` falls back
+        // to is already gone — and its other source, the `order:` record, is
+        // written by `handlePay` only after a receipt lands, which the slow
+        // 202 path never reaches.
+        //
+        // Both sources absent means the COMPLETION webhook is dropped: the one
+        // event a merchant hangs fulfilment off, lost precisely for the payment
+        // that took longest. Writing it here makes the placement the source of
+        // truth, which is the one moment the link id is guaranteed present.
+        await env.KV.put(
+          `order:${orderId}`,
+          JSON.stringify({ linkId: linkId.toLowerCase(), merchant }),
+          { expirationTtl: 2_592_000 }
+        );
+      } else {
+        continue;
+      }
+
+      // Only link orders — a POS sale has no link at all.
+      //
+      // The KV record is written after the receipt lands, so a slow
+      // confirmation (the 202 path) never writes it: the customer pays, the LP
+      // completes, and the merchant's notification is silently dropped for the
+      // one order that took longest. The binding is on-chain regardless, so
+      // fall back to it.
+      linkId = linkId ?? (await linkIdFor(env, client, orderId));
+      if (!linkId) continue;
+
+      // Deduped per ORDER AND EVENT. Keying on the order alone would let the
+      // first notification suppress every later one, so a merchant who got
+      // "placed" would never hear that it completed.
+      const sentKey = `hook:sent:${event}:${orderId}`;
+      if (await env.KV.get(sentKey)) continue;
+
+      const url = await webhookUrlFor(env, linkId, merchant);
+      if (!url) continue;
+
+      const payload = JSON.stringify({
+        event,
+        linkId,
+        orderId: orderId.toString(),
+        merchant,
+        ...(amount === undefined ? {} : { amount: amount.toString() }),
+        txHash: log.transactionHash,
+        at: new Date().toISOString(),
+      });
+
+      const item: Pending = { url, payload, attempt: 0, nextAt: Date.now() };
+      await env.KV.put(`hook:q:${event}:${orderId}`, JSON.stringify(item), {
+        expirationTtl: 172_800,
+      });
+      queued++;
+    }
   }
 
   await env.KV.put("hook:cursor", String(to));
@@ -332,10 +529,30 @@ export async function deliverQueued(env: Env): Promise<number> {
     limit: BATCH,
   })) as { keys: { name: string }[]; list_complete: boolean };
 
-  if (!list_complete) {
+  // Explicitly false, not merely falsy: an undefined from a KV implementation
+  // that does not report it is not a backlog, and warning about one sends an
+  // operator looking for a problem that is not there.
+  if (list_complete === false) {
     console.warn(
       `[paylinks] webhook queue exceeds ${BATCH} this run; the remainder retries next tick`
     );
+  }
+
+  // A missing signing key is OUR misconfiguration, not the merchant's endpoint
+  // being down — and treating it as the latter is how it stays hidden.
+  //
+  // `sign` throws "Zero-length key is not supported" without one. That lands in
+  // the per-delivery catch below, counts as a failed attempt, burns the backoff
+  // schedule and dead-letters the notification. Every webhook dies silently,
+  // and the only visible symptom is merchants reporting they never hear from
+  // us. Stopping here leaves the queue intact, so nothing is lost and the
+  // deliveries go out once the key is set.
+  if (!env.WEBHOOK_SIGNING_KEY) {
+    console.error(
+      "[paylinks] WEBHOOK_SIGNING_KEY is not set — refusing to deliver. " +
+        "The queue is preserved; set the secret and deliveries resume."
+    );
+    return 0;
   }
 
   let delivered = 0;
@@ -346,7 +563,22 @@ export async function deliverQueued(env: Env): Promise<number> {
     const item = JSON.parse(raw) as Pending;
     if (Date.now() < item.nextAt) continue;
 
-    const orderId = k.name.slice("hook:q:".length);
+    // "hook:q:<event>:<orderId>" — the queue key carries both, because the
+    // scan dedupes on the pair. Keying on the order alone would let the first
+    // notification suppress every later one, so a merchant who heard "placed"
+    // would never hear that it completed.
+    const suffix = k.name.slice("hook:q:".length);
+
+    // The event is also read back out of the payload rather than parsed from
+    // the key, so the header a merchant filters on always matches the body they
+    // verify the signature over.
+    let eventName = "payment.completed";
+    try {
+      eventName = String((JSON.parse(item.payload) as { event?: string }).event ?? eventName);
+    } catch {
+      /* payload is ours; fall back to the default rather than dropping it */
+    }
+
     let ok = false;
 
     try {
@@ -356,7 +588,7 @@ export async function deliverQueued(env: Env): Promise<number> {
         headers: {
           "Content-Type": "application/json",
           "X-PayQR-Signature": `sha256=${signature}`,
-          "X-PayQR-Event": "payment.completed",
+          "X-PayQR-Event": eventName,
         },
         body: item.payload,
         signal: AbortSignal.timeout(10_000),
@@ -368,7 +600,7 @@ export async function deliverQueued(env: Env): Promise<number> {
 
     if (ok) {
       await env.KV.delete(k.name);
-      await env.KV.put(`hook:sent:${orderId}`, "1", { expirationTtl: 2_592_000 });
+      await env.KV.put(`hook:sent:${suffix}`, "1", { expirationTtl: 2_592_000 });
       delivered++;
       continue;
     }
@@ -378,7 +610,7 @@ export async function deliverQueued(env: Env): Promise<number> {
       // Out of retries — keep it visible for manual replay rather than
       // dropping a real payment notification on the floor.
       await env.KV.delete(k.name);
-      await env.KV.put(`hook:dead:${orderId}`, raw, { expirationTtl: 2_592_000 });
+      await env.KV.put(`hook:dead:${suffix}`, raw, { expirationTtl: 2_592_000 });
       continue;
     }
     item.nextAt = Date.now() + BACKOFF_MS[item.attempt];

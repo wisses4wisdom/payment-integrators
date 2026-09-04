@@ -18,11 +18,31 @@ return a message a customer can act on.
 | `POST /api/links/:linkId/wallet` | Merchant-signed. Mints the link's wallet and returns the account address to batch into `registerAgent`. **A link cannot be paid until this has run.** |
 | `POST /api/pay/:linkId` | The customer taps Pay. Returns `{ orderId, txHash, claimToken }`. |
 | `POST /api/relay-tx` | Mark paid / cancel. Requires the claim token AND the customer's EIP-712 signature. |
-| `POST /api/links` | Registers a webhook URL for a link the caller owns. |
+| `POST /api/links` | Registers a webhook URL for ONE link the caller owns. Wins over the merchant default. |
+| `POST /api/merchants/webhook` | One callback for every link a merchant owns. Merchant-signed, ERC-1271 aware. |
 | `POST /api/admin/blocks` | Operator blocklist — list, look up, block, unblock. Authorised against the integrator's own roles, not a shared secret. |
 | `POST /api/sponsor-check` | The sponsorship provider's server verifier. Holds the per-link operation ceiling. **Fails closed without `SPONSOR_VERIFIER_SECRET`.** |
 | `GET /health` | Liveness. |
 
+
+### Webhook events
+
+Merchants register a callback and receive signed deliveries. Custom business
+logic — account activation, notifications, a token transfer — hangs off these,
+so which event fires and when is the contract.
+
+| event | fires on | means |
+|---|---|---|
+| `payment.placed` | a customer started paying | **NOT money.** Show a pending state; do not ship. |
+| `payment.completed` | the LP confirmed real fiat and USDC settled | Money moved. Safe to activate, notify, transfer. |
+| `payment.cancelled` | the order was abandoned or expired | Release whatever `placed` had you hold. |
+
+`placed` and `completed` are deliberately separate events rather than one with
+a status field: acting on the first is how a merchant ships goods for a payment
+that never arrives.
+
+Every delivery carries `X-PayQR-Event` and an `X-PayQR-Signature` HMAC over the
+raw body, is retried with backoff, and is deduped per order AND event.
 ### The pay path
 
 ```

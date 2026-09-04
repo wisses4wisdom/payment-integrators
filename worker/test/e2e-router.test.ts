@@ -8,6 +8,7 @@ import {
   defineChain,
   http,
   toHex,
+  encodeFunctionData,
   parseUnits,
   keccak256,
   toBytes,
@@ -20,6 +21,7 @@ import { createLinkWallet, linkWalletAddress, linkSigner, keyTtlFor } from "../s
 import { placeOrder, markPaid, cancelOrder } from "../src/linkOps";
 import { predictAccount } from "../src/aa";
 import { handleSponsorCheck } from "../src/sponsor";
+import { scanAndQueue, deliverQueued } from "../src/webhooks";
 import { ENTRYPOINT_ABI, LINK_ROUTER_ABI, INTEGRATOR_ABI, type Env } from "../src/config";
 
 /**
@@ -118,6 +120,10 @@ d("payment links without a relayer wallet — worker, end to end", () => {
     store = new Map<string, string>();
     return {
       CHAIN_ID: String(A.chainId),
+      // Deliveries are HMAC-signed, and `sign` throws without a key — which the
+      // per-delivery catch would turn into a failed attempt rather than a
+      // configuration error.
+      WEBHOOK_SIGNING_KEY: "test-webhook-signing-key",
       RPC_URL: A.rpcUrl,
       INTEGRATOR_ADDRESS: A.integrator,
       DIAMOND_ADDRESS: A.diamond,
@@ -139,7 +145,16 @@ d("payment links without a relayer wallet — worker, end to end", () => {
         get: async (k: string) => store.get(k) ?? null,
         put: async (k: string, v: string) => void store.set(k, v),
         delete: async (k: string) => void store.delete(k),
-        list: async () => ({ keys: [] }),
+        // A real listing: `deliverQueued` walks `hook:q:` keys, so a stub
+        // returning nothing means nothing is ever delivered — the queue fills
+        // and the test sees silence rather than a failure.
+        list: async ({ prefix = "", limit = 1000 }: any = {}) => ({
+          keys: [...store.keys()]
+            .filter((k) => k.startsWith(prefix))
+            .slice(0, limit)
+            .map((name) => ({ name })),
+          list_complete: true,
+        }),
       } as unknown as KVNamespace,
     } as unknown as Env;
   }
@@ -559,11 +574,186 @@ d("payment links without a relayer wallet — worker, end to end", () => {
     const decision = (await res.json()) as { isAllowed: boolean };
     expect(decision.isAllowed).toBe(true);
   });
+
+  // ─── Webhooks, from real chain logs ───────────────────────────────
+
+  describe("the merchant's callback", () => {
+    /**
+     * Custom business logic — activation, notifications, a token transfer —
+     * hangs off these. So which event fires, and when, is the whole contract.
+     *
+     * The important distinction is `placed` versus `completed`. Placed means a
+     * customer started paying; completed means the LP confirmed real fiat and
+     * USDC actually settled. Acting on the first is how a merchant ships goods
+     * for a payment that never arrives, so they are deliberately separate
+     * events rather than one with a status field.
+     *
+     * Everything below is driven from REAL logs the chain emitted during a real
+     * payment — nothing is synthesised.
+     */
+    const received: Array<{ event: string; body: any; sig: string | null }> = [];
+
+    /** Captures deliveries without a server, leaving the chain reads real. */
+    function captureDeliveries() {
+      const original = globalThis.fetch;
+      (globalThis as any).fetch = async (url: any, init: any) => {
+        const u = String(url);
+        if (u.startsWith("https://merchant.test/")) {
+          received.push({
+            event: init?.headers?.["X-PayQR-Event"] ?? null,
+            body: JSON.parse(String(init?.body ?? "{}")),
+            sig: init?.headers?.["X-PayQR-Signature"] ?? null,
+          });
+          return new Response("ok", { status: 200 });
+        }
+        return (original as any)(url, init);
+      };
+      return () => void ((globalThis as any).fetch = original);
+    }
+
+    async function drain() {
+      // Loop on the CURSOR, not on how many were queued. scanAndQueue returns
+      // the number queued, so a window containing no matching logs returns 0
+      // while blocks still remain — stopping there leaves the events that
+      // matter unscanned.
+      for (let i = 0; i < 30; i++) {
+        await scanAndQueue(env);
+        await deliverQueued(env);
+        const cursor = BigInt((await env.KV.get("hook:cursor")) ?? "0");
+        if (cursor >= (await pub.getBlockNumber())) break;
+      }
+      // One more pass: the last scan may have queued something it had no turn
+      // to deliver.
+      await deliverQueued(env);
+    }
+
+    it("fires placed, then completed — and they are different events", async () => {
+      received.length = 0;
+      const restore = captureDeliveries();
+      try {
+        await setupLink(3);
+        // A merchant-level callback, so one registration covers every link.
+        await env.KV.put(
+          `hook:merchant:${String(A.merchant).toLowerCase()}`,
+          "https://merchant.test/hook"
+        );
+        // Start the cursor here so the scan does not replay the whole chain.
+        await env.KV.put("hook:cursor", String(await pub.getBlockNumber()));
+
+        await place();
+        const orderId = await lastOrderId();
+        await drain();
+
+        const placed = received.find((r) => r.body.event === "payment.placed");
+        expect(placed, "no payment.placed delivered").toBeTruthy();
+        expect(placed!.body.orderId).toBe(orderId.toString());
+        expect(placed!.body.linkId.toLowerCase()).toBe(LINK.toLowerCase());
+        // Signed, so the merchant can tell it came from us.
+        expect(placed!.sig).toMatch(/^sha256=[0-9a-f]{64}$/);
+        // The header a merchant filters on matches the body they verify.
+        expect(placed!.event).toBe("payment.placed");
+
+        // No money has moved yet, and nothing says it has.
+        expect(received.some((r) => r.body.event === "payment.completed")).toBe(false);
+
+        // Now settle it for real.
+        const lp = createWalletClient({
+          account: privateKeyToAccount(
+            "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba"
+          ),
+          chain,
+          transport: http(A.rpcUrl),
+        });
+        await pub.waitForTransactionReceipt({
+          hash: await lp.writeContract({
+            address: A.diamond as Address,
+            abi: [
+              {
+                type: "function",
+                name: "simulateOrderAccepted",
+                stateMutability: "nonpayable",
+                inputs: [{ type: "uint256" }],
+                outputs: [],
+              },
+            ] as const,
+            functionName: "simulateOrderAccepted",
+            args: [orderId],
+          }),
+        });
+        await markPaid(env, LINK, orderId, (await signAction("MarkPaid", orderId)) as Hex);
+        await pub.waitForTransactionReceipt({
+          hash: await lp.writeContract({
+            address: A.diamond as Address,
+            abi: [
+              {
+                type: "function",
+                name: "simulateOrderComplete",
+                stateMutability: "nonpayable",
+                inputs: [{ type: "uint256" }],
+                outputs: [],
+              },
+            ] as const,
+            functionName: "simulateOrderComplete",
+            args: [orderId],
+            gas: 3_000_000n,
+          }),
+        });
+
+        await drain();
+
+        const done = received.find((r) => r.body.event === "payment.completed");
+        expect(done, "no payment.completed delivered").toBeTruthy();
+        expect(done!.body.orderId).toBe(orderId.toString());
+        // Only this one carries the settled amount, because only this one means
+        // money moved.
+        expect(done!.body.amount).toBeTruthy();
+      } finally {
+        restore();
+      }
+    }, 300_000);
+
+    it("fires cancelled, so a builder can release what they held", async () => {
+      received.length = 0;
+      const restore = captureDeliveries();
+      try {
+        await setupLink(3);
+        await env.KV.put(
+          `hook:merchant:${String(A.merchant).toLowerCase()}`,
+          "https://merchant.test/hook"
+        );
+        await env.KV.put("hook:cursor", String(await pub.getBlockNumber()));
+
+        await place();
+        const orderId = await lastOrderId();
+        await cancelOrder(env, LINK, orderId, (await signAction("Cancel", orderId)) as Hex);
+        await drain();
+
+        expect(received.some((r) => r.body.event === "payment.cancelled")).toBe(true);
+      } finally {
+        restore();
+      }
+    }, 300_000);
+
+    it("delivers nothing when no callback is registered", async () => {
+      received.length = 0;
+      const restore = captureDeliveries();
+      try {
+        await setupLink(1);
+        await env.KV.delete(`hook:merchant:${String(A.merchant).toLowerCase()}`);
+        await env.KV.put("hook:cursor", String(await pub.getBlockNumber()));
+
+        await place();
+        await drain();
+        expect(received).toHaveLength(0);
+      } finally {
+        restore();
+      }
+    }, 300_000);
+  });
 });
 
 /** The Router `place` call data, for the verifier test. */
 function encodeRouterPlace(linkId: Hex): Hex {
-  const { encodeFunctionData } = require("viem");
   return encodeFunctionData({
     abi: LINK_ROUTER_ABI,
     functionName: "place",
