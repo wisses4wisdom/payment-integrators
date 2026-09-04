@@ -15,10 +15,13 @@ return a message a customer can act on.
 
 | | |
 |---|---|
-| `POST /api/pay/:linkId` | The customer taps Pay. Returns `{ orderId, txHash }`. |
-| `POST /api/relay-tx` | Forwards the two transactions the widget signs itself. |
+| `POST /api/links/:linkId/wallet` | Merchant-signed. Mints the link's wallet and returns the account address to batch into `registerAgent`. **A link cannot be paid until this has run.** |
+| `POST /api/pay/:linkId` | The customer taps Pay. Returns `{ orderId, txHash, claimToken }`. |
+| `POST /api/relay-tx` | Mark paid / cancel. Requires the claim token AND the customer's EIP-712 signature. |
 | `POST /api/links` | Registers a webhook URL for a link the caller owns. |
-| `GET /health` | Relayer address, gas balance, low-balance flag. |
+| `POST /api/admin/blocks` | Operator blocklist — list, look up, block, unblock. Authorised against the integrator's own roles, not a shared secret. |
+| `POST /api/sponsor-check` | The sponsorship provider's server verifier. Holds the per-link operation ceiling. **Fails closed without `SPONSOR_VERIFIER_SECRET`.** |
+| `GET /health` | Liveness. |
 
 ### The pay path
 

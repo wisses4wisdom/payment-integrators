@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
+import { requireFixture } from "./fixture";
 import {
   createPublicClient,
   createWalletClient,
@@ -99,11 +100,11 @@ import {
  *      that returns 200 while the order stalls at PLACED is the original bug.
  */
 
-const ADDRESSES_PATH = new URL("./e2e-addresses.json", import.meta.url).pathname.replace(
-  /^\/([A-Za-z]:)/,
-  "$1"
-);
-export const HAS_E2E_FIXTURE = existsSync(ADDRESSES_PATH);
+// The URL object goes straight to existsSync/readFileSync, both of which
+// accept one. The previous drive-letter fix only mattered because the path
+// was being stringified at all.
+const ADDRESSES_PATH = new URL("./e2e-addresses.json", import.meta.url);
+export const HAS_E2E_FIXTURE = requireFixture(ADDRESSES_PATH, "e2e-hardening");
 
 const addresses: Addresses = HAS_E2E_FIXTURE
   ? JSON.parse(readFileSync(ADDRESSES_PATH, "utf8"))

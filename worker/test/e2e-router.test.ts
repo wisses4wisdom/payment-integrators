@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, beforeEach } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
+import { requireFixture } from "./fixture";
 import { webcrypto } from "node:crypto";
 import {
   createPublicClient,
@@ -42,8 +43,14 @@ import { ENTRYPOINT_ABI, LINK_ROUTER_ABI, INTEGRATOR_ABI, type Env } from "../sr
 
 if (!(globalThis as any).crypto) (globalThis as any).crypto = webcrypto;
 
-const ADDR_FILE = new URL("./e2e-addresses.json", import.meta.url).pathname.replace(/^\//, "");
-const have = existsSync(ADDR_FILE);
+// The URL object is passed straight to existsSync/readFileSync, which both
+// accept one. Converting to a string with `.pathname` and stripping the
+// leading slash is a Windows drive-letter fix that BREAKS POSIX: it leaves
+// "/D:/..." absolute but turns "/home/..." into a relative path resolved
+// against cwd. The result was always false on Linux, so these suites ran on
+// a developer machine and silently skipped in CI.
+const ADDR_FILE = new URL("./e2e-addresses.json", import.meta.url);
+const have = requireFixture(ADDR_FILE, "e2e-router");
 const d = describe.skipIf(!have);
 
 let A: any;
@@ -126,6 +133,8 @@ d("payment links without a relayer wallet — worker, end to end", () => {
       PAYMASTER_URL: "http://local-bundler/rpc",
       LINK_KEY_MASTER: Buffer.from(new Uint8Array(32).fill(5)).toString("base64"),
       MAX_SPONSORED_OPS_PER_LINK: "20",
+      // The verifier fails CLOSED without this — see sponsor.ts.
+      SPONSOR_VERIFIER_SECRET: "test-sponsor-secret",
       KV: {
         get: async (k: string) => store.get(k) ?? null,
         put: async (k: string, v: string) => void store.set(k, v),
@@ -530,7 +539,11 @@ d("payment links without a relayer wallet — worker, end to end", () => {
     const res = await handleSponsorCheck(
       new Request("https://w/api/sponsor-check", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          // The verifier fails closed without this.
+          "X-Sponsor-Secret": "test-sponsor-secret",
+        },
         body: JSON.stringify({
           chainId: A.chainId,
           userOp: {

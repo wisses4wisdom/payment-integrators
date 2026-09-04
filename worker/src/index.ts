@@ -9,9 +9,7 @@
  */
 
 import type { Env } from "./config";
-import { limitsFor } from "./config";
-import { publicClientFor, relayerFor } from "./chain";
-import { checkBalance } from "./limits";
+import { publicClientFor } from "./chain";
 import { handlePay } from "./pay";
 import { handleRelayTx } from "./relayTx";
 import { handleRegisterWebhook, scanAndQueue, deliverQueued, sweepFalseClaims } from "./webhooks";
@@ -19,6 +17,7 @@ import { json, corsHeaders } from "./http";
 import { turnstileEnabled } from "./turnstile";
 import { handleSponsorCheck } from "./sponsor";
 import { handleAdmin } from "./admin";
+import { handleProvisionWallet } from "./provision";
 
 export { LinkLock, NonceManager, GasBudget } from "./durable";
 
@@ -40,11 +39,24 @@ export default {
       res = await handlePay(req, env, path.slice("/api/pay/".length));
     } else if (req.method === "POST" && path === "/api/relay-tx") {
       res = await handleRelayTx(req, env);
+    } else if (req.method === "POST" && /^\/api\/links\/[^/]+\/wallet$/.test(path)) {
+      // Mints the wallet a link is driven by, and returns the address the
+      // merchant batches into registerAgent. Without this nothing in
+      // production ever creates a link wallet, and every payment fails with
+      // "this link is no longer active" (round-3 B1).
+      res = await handleProvisionWallet(
+        req,
+        env,
+        path.slice("/api/links/".length, -"/wallet".length)
+      );
     } else if (req.method === "POST" && path === "/api/links") {
       res = await handleRegisterWebhook(req, env);
     } else if (path === "/api/admin/blocks") {
-      // Operator only. Guarded by a shared secret that fails CLOSED — an unset
-      // variable must not leave the blocklist editable by anyone.
+      // Operator only. Authorised against the INTEGRATOR'S OWN ROLES — the
+      // super-admin and every owner qualify, an admin assigned on-chain gains
+      // access, one removed loses it. No shared secret to distribute or rotate,
+      // and every action is attributable to a wallet rather than to whoever had
+      // the password. See adminAuth.ts.
       res = await handleAdmin(req, env);
     } else if (req.method === "POST" && path === "/api/sponsor-check") {
       // Called by the sponsorship provider, not by users. This is where the
@@ -68,15 +80,12 @@ export default {
           const delivered = await deliverQueued(env);
           const strikes = await sweepFalseClaims(env);
 
-          const client = publicClientFor(env);
-          const { address } = relayerFor(env);
-          const balance = await client.getBalance({ address });
-          const warning = await checkBalance(env, balance, address);
-          if (warning) console.warn(`[paylinks] ${warning}`);
-
-          console.log(
-            `[paylinks] queued=${queued} delivered=${delivered} strikes=${strikes} balance=${balance} wei`
-          );
+          // The relayer balance check is gone with the relayer. Watching a
+          // wallet whose emptiness is the design told an operator nothing, and
+          // made RELAYER_PRIVATE_KEY a hard requirement for a cron that no
+          // longer needs it. What needs watching now is the sponsorship budget,
+          // which lives at the provider.
+          console.log(`[paylinks] queued=${queued} delivered=${delivered} strikes=${strikes}`);
         } catch (err) {
           console.error("[paylinks] scheduled run failed:", err);
         }
@@ -97,14 +106,22 @@ export default {
 async function health(env: Env): Promise<Response> {
   try {
     const client = publicClientFor(env);
-    const { address } = relayerFor(env);
-    const [block, balance] = await Promise.all([
-      client.getBlockNumber(),
-      client.getBalance({ address }),
-    ]);
+    const block = await client.getBlockNumber();
+
+    // No relayer balance any more, and no `lowBalance` flag.
+    //
+    // Round-3 review, L4: reporting one was actively misleading. The relayer
+    // key is not on the payment path — the sender is each link's own account,
+    // which holds nothing by design — so a "low balance" signal described a
+    // wallet whose emptiness is the point, and an operator watching it would be
+    // watching the wrong thing. It also made `RELAYER_PRIVATE_KEY` a hard
+    // requirement for liveness on a deployment that no longer needs it for
+    // payments.
+    //
+    // What still needs watching is the SPONSORSHIP budget, which lives at the
+    // provider and is not ours to report here.
     return json({
       ok: true,
-      lowBalance: balance < limitsFor(env).lowBalanceWei,
       block: block.toString(),
       // AUDIT N2. Whether the human-cost gate is actually live is not
       // something an operator should have to infer from a deploy log. It is

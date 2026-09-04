@@ -21,11 +21,15 @@
  * owner clear it automatically by reading as FINANCE.
  *
  * WHAT THE SIGNATURE COVERS
- * The action, the address it concerns, and an expiry. A signature that named
- * only the signer would be a bearer token: capture one unblock request and you
- * could replay it for any address, forever. Binding the action and adding a
- * short window makes a captured signature useful only for the thing it already
- * did, and only briefly.
+ * The action, the address it concerns, an expiry, and a nonce. A signature that
+ * named only the signer would be a bearer token: capture one unblock request
+ * and you could replay it for any address, forever.
+ *
+ * The nonce closes what the expiry alone left open. Within the window a
+ * captured signature could be replayed for the same (action, ip) — harmless for
+ * an unblock, less so for a block. Each nonce is single-use and remembered for
+ * the length of the window, which is exactly as long as a signature can be
+ * valid, so the store never grows beyond that.
  */
 
 import { verifyTypedData, type Address, type Hex } from "viem";
@@ -63,6 +67,8 @@ export interface AdminRequest {
   ip?: string;
   /** Unix seconds. The signature is void after this. */
   expiry?: number;
+  /** Single-use. Any string the caller has not used before. */
+  nonce?: string;
 }
 
 /**
@@ -73,8 +79,9 @@ export interface AdminRequest {
  * "insufficient tier" tells an attacker which half to work on.
  */
 export async function verifyAdmin(env: Env, req: AdminRequest): Promise<AdminAuth | null> {
-  const { signer, signature, action, ip, expiry } = req;
+  const { signer, signature, action, ip, expiry, nonce } = req;
   if (!signer || !signature || !action || typeof expiry !== "number") return null;
+  if (!nonce || nonce.length > 128) return null;
 
   // Expiry first: it is free, and it is the check most likely to fail on a
   // replayed request.
@@ -103,10 +110,11 @@ export async function verifyAdmin(env: Env, req: AdminRequest): Promise<AdminAut
           { name: "action", type: "string" },
           { name: "ip", type: "string" },
           { name: "expiry", type: "uint256" },
+          { name: "nonce", type: "string" },
         ],
       },
       primaryType: "AdminAction",
-      message: { action, ip: ip ?? "", expiry: BigInt(expiry) },
+      message: { action, ip: ip ?? "", expiry: BigInt(expiry), nonce: nonce ?? "" },
       signature: signature as Hex,
     });
   } catch {
@@ -133,5 +141,13 @@ export async function verifyAdmin(env: Env, req: AdminRequest): Promise<AdminAut
   }
 
   if (tier < MIN_ADMIN_TIER) return null;
+
+  // Burn the nonce LAST, so a request that was going to be refused anyway does
+  // not consume one. Remembered only for the window, because a signature cannot
+  // outlive it.
+  const seen = `admin:nonce:${signer.toLowerCase()}:${nonce}`;
+  if (await env.KV.get(seen)) return null;
+  await env.KV.put(seen, "1", { expirationTtl: AUTH_WINDOW_SECONDS });
+
   return { signer: signer as Address, tier };
 }

@@ -77,18 +77,31 @@ const deny = (reason: string) => json({ isAllowed: false, reason }, 200);
  * sending a transaction.
  */
 export async function handleSponsorCheck(req: Request, env: Env): Promise<Response> {
-  if (env.SPONSOR_VERIFIER_SECRET) {
-    const got = req.headers.get("X-Sponsor-Secret");
-    // Length check first so the comparison below is over equal-length strings.
-    if (!got || got.length !== env.SPONSOR_VERIFIER_SECRET.length) {
-      return deny("unauthorized");
-    }
-    let diff = 0;
-    for (let i = 0; i < got.length; i++) {
-      diff |= got.charCodeAt(i) ^ env.SPONSOR_VERIFIER_SECRET.charCodeAt(i);
-    }
-    if (diff !== 0) return deny("unauthorized");
+  // FAILS CLOSED when unset.
+  //
+  // This used to run unauthenticated with no secret configured, which is
+  // exactly the hole the secret exists to close — round-3 review, M2. The
+  // header of this file already said an outsider must not be able to "exhaust a
+  // link's budget without ever sending a transaction", and an unset variable
+  // permitted precisely that: DEFAULT_MAX_OPS_PER_LINK unauthenticated POSTs
+  // naming a link, and every real payment on it refused for the counter's whole
+  // 30-day life.
+  //
+  // Turnstile fails open, for a reason that does not apply here: leaving that
+  // off degrades a spam control on a path that is otherwise safe. The admin
+  // routes already fail closed. This was the odd one out.
+  if (!env.SPONSOR_VERIFIER_SECRET) return deny("verifier not configured");
+
+  const got = req.headers.get("X-Sponsor-Secret");
+  // Length check first so the comparison below is over equal-length strings.
+  if (!got || got.length !== env.SPONSOR_VERIFIER_SECRET.length) {
+    return deny("unauthorized");
   }
+  let diff = 0;
+  for (let i = 0; i < got.length; i++) {
+    diff |= got.charCodeAt(i) ^ env.SPONSOR_VERIFIER_SECRET.charCodeAt(i);
+  }
+  if (diff !== 0) return deny("unauthorized");
 
   let body: VerifyRequest;
   try {
@@ -117,11 +130,14 @@ export async function handleSponsorCheck(req: Request, env: Env): Promise<Respon
   const used = Number((await env.KV.get(opsKey(linkId))) ?? "0");
   if (used >= cap) return deny(`link exhausted its sponsorship allowance (${cap})`);
 
-  // Not atomic, and deliberately so: KV counts are eventually consistent, and
-  // over- or under-counting by one at the margin does not matter for a ceiling
-  // whose job is to stop a loop, not to meter billing precisely. Making this
-  // strictly atomic would put a Durable Object on the sponsorship path — cost
-  // and latency on every payment, to fix an off-by-one in a blunt instrument.
+  // Not atomic, and deliberately so — but the earlier note here understated it.
+  // KV's consistency window is up to ~60s, not one operation, so a concurrent
+  // burst overshoots this ceiling by considerably more than one. That is
+  // acceptable for a blunt backstop whose job is to stop an unbounded loop
+  // rather than to meter spend: the bound that matters is the provider's own
+  // global spend limit, which IS authoritative. Making this strictly atomic
+  // would put a Durable Object on the sponsorship path — cost and latency on
+  // every payment — to sharpen an instrument that does not need to be sharp.
   await env.KV.put(opsKey(linkId), String(used + 1), { expirationTtl: 30 * 24 * 60 * 60 });
 
   return json({ isAllowed: true }, 200);

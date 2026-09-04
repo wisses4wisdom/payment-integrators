@@ -233,6 +233,9 @@ export function makeTestEnv(a: Addresses, overrides: EnvOverrides = {}): Env {
     PAYMASTER_URL: "http://local-bundler/rpc",
     LINK_KEY_MASTER: Buffer.from(new Uint8Array(32).fill(11)).toString("base64"),
     MAX_SPONSORED_OPS_PER_LINK: "50",
+    // The verifier fails CLOSED without this, which is the point of it — see
+    // sponsor.ts. A deploy without it has no per-link ceiling at all.
+    SPONSOR_VERIFIER_SECRET: "test-sponsor-secret",
 
     KV: memoryKV(),
     LINK_LOCK: memoryDO((s, p) => lockHandler(s, p), ctx),

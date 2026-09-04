@@ -14,11 +14,15 @@ export interface Env {
    * sequence that blocks under load. Payments now go through `LinkRouter`,
    * signed by a per-link wallet that holds nothing (see `linkWallet.ts`).
    *
-   * Kept only while the old path runs alongside the new one. Delete this,
-   * `relayerFor()`, and the `NonceManager` durable object together, once
-   * link traffic is fully on the Router.
+   * OPTIONAL, and no longer read by anything on the payment path: not by
+   * `/health`, not by the cron, not by `pay` or `relayTx`. The only remaining
+   * reader is the `NonceManager` durable object, which nothing instantiates.
+   * A deploy without it works.
+   *
+   * Delete this, `relayerFor()` and `NonceManager` together once the keeper
+   * duty (`deliverFiatPayout`) has moved to its own operator key.
    */
-  RELAYER_PRIVATE_KEY: string;
+  RELAYER_PRIVATE_KEY?: string;
   /** HMAC key for outbound webhook signatures. */
   WEBHOOK_SIGNING_KEY: string;
   /**

@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
+import { requireFixture } from "./fixture";
 import {
   createPublicClient,
   createWalletClient,
@@ -49,8 +50,14 @@ import type { Env } from "../src/config";
  * Requires `npx hardhat node` and `scripts/e2e-setup.js`.
  */
 
-const ADDR = new URL("./e2e-addresses.json", import.meta.url).pathname.replace(/^\//, "");
-const HAVE = existsSync(ADDR);
+// The URL object is passed straight to existsSync/readFileSync, which both
+// accept one. Converting to a string with `.pathname` and stripping the
+// leading slash is a Windows drive-letter fix that BREAKS POSIX: it leaves
+// "/D:/..." absolute but turns "/home/..." into a relative path resolved
+// against cwd. The result was always false on Linux, so these suites ran on
+// a developer machine and silently skipped in CI.
+const ADDR = new URL("./e2e-addresses.json", import.meta.url);
+const HAVE = requireFixture(ADDR, "load");
 const addresses: Addresses = HAVE ? JSON.parse(readFileSync(ADDR, "utf8")) : ({} as Addresses);
 
 const USDC = (n: number) => parseUnits(String(n), 6);

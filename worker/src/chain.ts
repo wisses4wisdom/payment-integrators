@@ -30,7 +30,23 @@ export function publicClientFor(env: Env): PublicClient {
   return createPublicClient({ chain: chainFor(env), transport: http(env.RPC_URL) });
 }
 
+/**
+ * @deprecated Nothing on the payment path calls this. The sender is now each
+ * link's own account — see `linkOps`. It survives only for the `NonceManager`
+ * durable object, which nothing instantiates, and goes when the keeper duty
+ * moves to its own operator key.
+ *
+ * Throws a legible error rather than letting viem fail on `undefined`, because
+ * the key is optional now and reaching this without one is a wiring mistake
+ * worth naming.
+ */
 export function relayerFor(env: Env): { wallet: WalletClient; address: Address } {
+  if (!env.RELAYER_PRIVATE_KEY) {
+    throw new Error(
+      "relayerFor() called without RELAYER_PRIVATE_KEY. Nothing on the payment " +
+        "path needs it — the sender is each link's own account."
+    );
+  }
   const account = privateKeyToAccount(env.RELAYER_PRIVATE_KEY as Hex);
   return {
     wallet: createWalletClient({ account, chain: chainFor(env), transport: http(env.RPC_URL) }),

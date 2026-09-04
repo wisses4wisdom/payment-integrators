@@ -1,13 +1,13 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { webcrypto } from "node:crypto";
 import {
+  mintedBy,
   createLinkWallet,
   linkSigner,
   linkWalletAddress,
   linkOwnerAddress,
   destroyLinkWallet,
   keyTtlFor,
-  MAX_KEY_TTL,
 } from "../src/linkWallet";
 import type { Env } from "../src/config";
 
@@ -169,6 +169,16 @@ describe("per-link wallet keys", () => {
     expect(await linkSigner(env, LINK)).toBeNull();
   });
 
+  it("records which merchant provisioned it", async () => {
+    // Needed to tell a retry apart from someone else claiming the same link id.
+    // A second mint would produce a different address, and `registerAgent` is
+    // write-once — so handing back a fresh address on retry strands the link.
+    const merchant = "0x1234567890123456789012345678901234567890" as const;
+    await createLinkWallet(env, LINK, 3600, fakeFactory, merchant);
+    expect(await mintedBy(env, LINK)).toBe(merchant);
+    expect(await mintedBy(env, LINK2)).toBeNull();
+  });
+
   it("is case-insensitive about the link id", async () => {
     const account = await createLinkWallet(
       env,
@@ -189,15 +199,24 @@ describe("key lifetime", () => {
     expect(keyTtlFor(BigInt(NOW + 3600), NOW)).toBe(3600);
   });
 
-  it("caps a never-expiring link at 30 days", () => {
-    // The contract permits expiresAt = 0. A signing key must NOT inherit an
-    // unlimited life from that — an indefinitely valid key is the thing this
-    // whole design exists to remove.
-    expect(keyTtlFor(0n, NOW)).toBe(MAX_KEY_TTL);
+  it("gives a never-expiring link a key with NO expiry", () => {
+    // This asserted a 30-day cap, and the cap was a bug — round-3 M1.
+    //
+    // `createLink` permits expiresAt = 0. Capping the key at 30 days evicted it
+    // while the link was still ACTIVE, and `registerAgent` is WRITE-ONCE, so a
+    // fresh key — which derives a different account address — could never be
+    // bound. The link then failed for every customer, forever, with no way back.
+    //
+    // The cap bought nothing to offset that: this key can only place an order on
+    // one link at a price the merchant fixed, and settling needs the customer's
+    // signature on top. It is exactly as dangerous as the link being payable,
+    // which is what the merchant chose.
+    expect(keyTtlFor(0n, NOW)).toBeUndefined();
   });
 
-  it("caps a very distant expiry at 30 days too", () => {
-    expect(keyTtlFor(BigInt(NOW + 365 * 24 * 3600), NOW)).toBe(MAX_KEY_TTL);
+  it("follows a distant expiry rather than capping it", () => {
+    const year = 365 * 24 * 3600;
+    expect(keyTtlFor(BigInt(NOW + year), NOW)).toBe(year);
   });
 
   it("returns zero for an already-expired link", () => {

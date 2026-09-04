@@ -48,6 +48,15 @@ interface StoredKey {
    *  Kept in clear: both are public on-chain anyway, and having them avoids an
    *  unwrap just to answer "which address is this link". */
   account: Address;
+  /**
+   * The merchant who provisioned this wallet.
+   *
+   * Kept so a retry can be told apart from someone else claiming the same link
+   * id. A second mint would produce a different address, and `registerAgent` is
+   * write-once — so handing back a fresh address on retry would strand the link
+   * permanently.
+   */
+  minter?: Address;
 }
 
 const keyName = (linkId: string) => `linkkey:${linkId.toLowerCase()}`;
@@ -83,9 +92,10 @@ async function wrappingKey(env: Env, linkId: string): Promise<CryptoKey> {
 /**
  * Creates the wallet for a link and stores its key, wrapped.
  *
- * @param ttlSeconds How long the record lives. Callers pass the link's own
- *        expiry, capped — see `keyTtlFor`. The record evicting itself is what
- *        makes the wallet inert without any cleanup transaction.
+ * @param ttlSeconds How long the record lives, or undefined for no expiry —
+ *        see `keyTtlFor`. It tracks the LINK's life exactly: a key that expired
+ *        before its link would strand that link forever, because
+ *        `registerAgent` is write-once and a new key means a new address.
  * @param resolveAccount Turns the generated owner key into the SMART ACCOUNT
  *        address that key controls. Injected rather than imported so this module
  *        stays free of chain access and testable without one; production passes
@@ -96,8 +106,9 @@ async function wrappingKey(env: Env, linkId: string): Promise<CryptoKey> {
 export async function createLinkWallet(
   env: Env,
   linkId: string,
-  ttlSeconds: number,
-  resolveAccount: (owner: Address) => Promise<Address>
+  ttlSeconds: number | undefined,
+  resolveAccount: (owner: Address) => Promise<Address>,
+  minter?: Address
 ): Promise<Address> {
   const pk = generatePrivateKey();
   const account = privateKeyToAccount(pk);
@@ -116,8 +127,14 @@ export async function createLinkWallet(
     ct: b64(ct),
     owner: account.address,
     account: accountAddress,
+    minter,
   };
-  await env.KV.put(keyName(linkId), JSON.stringify(rec), { expirationTtl: ttlSeconds });
+  // No TTL when the link never expires — see `keyTtlFor`.
+  await env.KV.put(
+    keyName(linkId),
+    JSON.stringify(rec),
+    ttlSeconds === undefined ? {} : { expirationTtl: ttlSeconds }
+  );
   return accountAddress;
 }
 
@@ -179,6 +196,18 @@ export async function linkOwnerAddress(env: Env, linkId: string): Promise<Addres
   }
 }
 
+/** Which merchant provisioned this link's wallet, if any. Used to tell a
+ *  retry apart from someone else claiming the same link id. */
+export async function mintedBy(env: Env, linkId: string): Promise<Address | null> {
+  const raw = await env.KV.get(keyName(linkId));
+  if (!raw) return null;
+  try {
+    return (JSON.parse(raw) as StoredKey).minter ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /** Deletes a link's key. Used when a merchant revokes a link, so the wallet
  *  stops being drivable immediately rather than at expiry. */
 export async function destroyLinkWallet(env: Env, linkId: string): Promise<void> {
@@ -186,19 +215,40 @@ export async function destroyLinkWallet(env: Env, linkId: string): Promise<void>
 }
 
 /**
- * How long a link's key should live.
+ * How long a link's key should live: exactly as long as the link.
  *
- * The contract permits `expiresAt = 0`, meaning a link that never expires. A
- * key must NOT inherit an unlimited lifetime from that — an indefinitely valid
- * signing key is exactly what this design exists to remove. So the cap applies
- * in both directions: a never-expiring link gets a 30-day key and is re-issued
- * while it stays live.
+ * WHY THERE IS NO CAP ANY MORE
+ * There used to be a 30-day ceiling, on the reasoning that an indefinitely
+ * valid signing key is what this design exists to remove. Round-3 review, M1,
+ * showed that reasoning was wrong here and the cap was actively harmful:
+ *
+ *   • `createLink` permits `expiresAt = 0`, a link that never expires
+ *   • the cap evicted its key at day 30
+ *   • `registerAgent` is WRITE-ONCE, so a fresh key — which derives a different
+ *     account address — can never be bound
+ *
+ * The link then reads ACTIVE on-chain and fails for every customer, forever,
+ * with no way back. A comment here claimed the link "is re-issued while it
+ * stays live"; no such path existed, and the write-once binding is precisely
+ * what prevents one.
+ *
+ * The cap bought nothing to offset that. This key's entire power is placing an
+ * order on ONE link, at a price the merchant fixed, and mark-paid and cancel
+ * need the customer's signature on top. An indefinitely valid key to that is
+ * exactly as dangerous as an indefinitely payable link — which is what the
+ * merchant chose when they set no expiry. Capping the key BELOW the link's life
+ * created a failure; it prevented nothing.
+ *
+ * So: no expiry on the link, no expiry on the key. Revoking the link deletes it
+ * (`destroyLinkWallet`), which is the real off-switch.
  */
-export const MAX_KEY_TTL = 30 * 24 * 60 * 60;
-
-export function keyTtlFor(expiresAt: bigint, now = Math.floor(Date.now() / 1000)): number {
-  if (expiresAt === 0n) return MAX_KEY_TTL;
+export function keyTtlFor(
+  expiresAt: bigint,
+  now = Math.floor(Date.now() / 1000)
+): number | undefined {
+  // undefined => no expiry, matching a link that never expires.
+  if (expiresAt === 0n) return undefined;
   const remaining = Number(expiresAt) - now;
   if (remaining <= 0) return 0;
-  return Math.min(remaining, MAX_KEY_TTL);
+  return remaining;
 }

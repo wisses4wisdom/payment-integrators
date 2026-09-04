@@ -65,6 +65,7 @@ vi.mock("../src/chain", () => ({
 const IP = "203.0.113.7";
 const OTHER = "203.0.113.9";
 
+let nonceSeq = 0;
 const nowSec = () => Math.floor(Date.now() / 1000);
 
 /** Signs an operator request the way the admin panel would. */
@@ -72,10 +73,13 @@ async function signAdmin(
   env: Env,
   who: ReturnType<typeof privateKeyToAccount>,
   msg: { action: string; ip?: string; reason?: string },
-  over: { expiry?: number; integrator?: string } = {}
+  over: { expiry?: number; integrator?: string; nonce?: string } = {}
 ) {
   const expiry = over.expiry ?? nowSec() + 120;
   const ip = msg.ip ?? "";
+  // Unique per request unless a test pins it, which is how the replay case
+  // below is exercised.
+  const nonce = over.nonce ?? `n-${nonceSeq++}-${Math.random().toString(36).slice(2)}`;
   const signature = await who.signTypedData({
     domain: {
       name: "P2P Merchant Terminal Admin",
@@ -88,12 +92,13 @@ async function signAdmin(
         { name: "action", type: "string" },
         { name: "ip", type: "string" },
         { name: "expiry", type: "uint256" },
+        { name: "nonce", type: "string" },
       ],
     },
     primaryType: "AdminAction",
-    message: { action: msg.action, ip, expiry: BigInt(expiry) },
+    message: { action: msg.action, ip, expiry: BigInt(expiry), nonce },
   });
-  return { ...msg, signer: who.address, signature, expiry };
+  return { ...msg, signer: who.address, signature, expiry, nonce };
 }
 
 /** Signs and sends one operator request. */
@@ -101,7 +106,7 @@ async function admin(
   env: Env,
   who: ReturnType<typeof privateKeyToAccount>,
   msg: { action: string; ip?: string; reason?: string },
-  over: { expiry?: number; integrator?: string } = {}
+  over: { expiry?: number; integrator?: string; nonce?: string } = {}
 ) {
   const body = await signAdmin(env, who, msg, over);
   return handleAdmin(
@@ -437,6 +442,37 @@ describe("the signature itself", () => {
       env
     );
     expect(res.status).toBe(404);
+  });
+
+  it("refuses a REPLAYED signature, even inside the window", async () => {
+    // What the expiry alone left open: within 300s a captured signature could
+    // be replayed for the same (action, ip). Harmless for an unblock, less so
+    // for a block.
+    const signed = await signAdmin(env, OWNER, { action: "unblock", ip: IP });
+    const send = () =>
+      handleAdmin(
+        new Request("https://w/api/admin/blocks", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(signed),
+        }),
+        env
+      );
+
+    expect((await send()).status).toBe(200);
+    await blockIp(env, IP, 3);
+    // Same bytes, second time: refused.
+    expect((await send()).status).toBe(404);
+    expect(await blockRecord(env, IP)).not.toBeNull();
+  });
+
+  it("does not burn a nonce on a request that was refused anyway", async () => {
+    // Otherwise a stranger could exhaust an operator's nonces by guessing.
+    const n = "fixed-nonce-for-this-test";
+    expect((await admin(env, STRANGER, { action: "unblock", ip: IP }, { nonce: n })).status).toBe(
+      404
+    );
+    expect((await admin(env, OWNER, { action: "unblock", ip: IP }, { nonce: n })).status).toBe(200);
   });
 
   it("refuses a forged signature claiming to be the owner", async () => {

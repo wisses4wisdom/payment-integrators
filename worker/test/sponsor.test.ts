@@ -185,10 +185,25 @@ describe("sponsorship verifier", () => {
     expect((await ask(env, placeCall(LINK), { secret: "wrong" })).status).toBe(200);
   });
 
-  it("runs with no secret configured, for local development", async () => {
+  it("FAILS CLOSED when no secret is configured", async () => {
+    // This test asserted the opposite, and the inversion is the finding.
+    //
+    // Running unauthenticated when the variable is unset is exactly the hole
+    // the secret exists to close: this file's own header says an outsider must
+    // not be able to "exhaust a link's budget without ever sending a
+    // transaction", and an unset variable permitted precisely that. An
+    // incomplete deploy removed the gate silently, because wrangler.toml lists
+    // the secret only as something to `wrangler secret put`.
     const e = fakeEnv({ SPONSOR_VERIFIER_SECRET: undefined }).env;
-    expect((await decide(await ask(e, placeCall(LINK), { secret: null as any }))).isAllowed).toBe(
-      true
-    );
+    const r = await decide(await ask(e, placeCall(LINK), { secret: null as any }));
+    expect(r.isAllowed).toBe(false);
+  });
+
+  it("an unauthenticated caller cannot spend a link's allowance", async () => {
+    // The attack the previous behaviour allowed, stated directly: 20 POSTs and
+    // every real payment on that link is refused for the counter's whole life.
+    const e = fakeEnv({ SPONSOR_VERIFIER_SECRET: undefined }).env;
+    for (let i = 0; i < 25; i++) await ask(e, placeCall(LINK), { secret: null as any });
+    expect(await sponsoredOps(e, LINK)).toBe(0);
   });
 });
