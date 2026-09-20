@@ -82,8 +82,11 @@ async function rpc<T>(
   return body.result as T;
 }
 
+// thirdweb's v2 bundler/paymaster does NOT accept `Authorization: Bearer` —
+// confirmed against the live endpoint, which returns 401
+// {"code":"MISSING_SERVICE_KEY"} for that header and 200 for `x-secret-key`.
 const bundlerHeaders = (env: Env): Record<string, string> =>
-  env.BUNDLER_SECRET ? { Authorization: `Bearer ${env.BUNDLER_SECRET}` } : {};
+  env.BUNDLER_SECRET ? { "x-secret-key": env.BUNDLER_SECRET } : {};
 
 /**
  * The account address for an owner, before it exists.
