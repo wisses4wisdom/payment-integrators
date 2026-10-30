@@ -562,10 +562,16 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     uint256 private _locked = 1;
 
     modifier nonReentrant() {
-        if (_locked != 1) revert Reentrancy();
-        _locked = 2;
+        _enter();
         _;
         _locked = 1;
+    }
+
+    /// @dev The guard's check-and-take, out of line: a modifier body is copied
+    ///      into every function that uses it, and this one guards 21.
+    function _enter() private {
+        if (_locked != 1) revert Reentrancy();
+        _locked = 2;
     }
 
     /// @dev A SECOND, independent guard for the Diamond's callbacks.
@@ -607,8 +613,12 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     /// @dev Gate NEW-activity entry points. Recovery/admin/Diamond-callback paths
     ///      are deliberately NOT gated (see `paused`).
     modifier whenNotPaused() {
-        if (paused) revert Paused();
+        _whenNotPaused();
         _;
+    }
+
+    function _whenNotPaused() private view {
+        if (paused) revert Paused();
     }
 
     // ─── Access modifiers ─────────────────────────────────────────────
@@ -627,8 +637,12 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///      access control: owner-set management (add/remove owners) and role
     ///      assignment. Owners below the super-admin cannot perform these.
     modifier onlySuperAdmin() {
-        if (msg.sender != superAdmin) revert OnlySuperAdmin();
+        _onlySuperAdmin();
         _;
+    }
+
+    function _onlySuperAdmin() private view {
+        if (msg.sender != superAdmin) revert OnlySuperAdmin();
     }
 
     /// @dev Any owner's EFFECTIVE tier is FINANCE (the top admin tier), so a
@@ -641,16 +655,33 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///      action at MANAGER also admits FINANCE and the owner. Reverts
     ///      NotAuthorized with the required and actual tiers for a clear panel msg.
     modifier onlyRole(Role min) {
+        _onlyRole(min);
+        _;
+    }
+
+    function _onlyRole(Role min) private view {
         Role have = _tier(msg.sender);
         if (uint8(have) < uint8(min)) revert NotAuthorized(uint8(min), uint8(have));
-        _;
+    }
+
+    /// @notice True if `who` can perform ANY admin action (an owner or any role).
+    function isAdmin(address who) public view returns (bool) {
+        return isOwner[who] || adminRole[who] != Role.NONE;
+    }
+
+    /// @notice True if `who` can perform MANAGER (config) actions or higher.
+    function isManager(address who) public view returns (bool) {
+        return uint8(_tier(who)) >= uint8(Role.MANAGER);
+    }
+
+    /// @notice True if `who` can perform FINANCE (money-recovery) actions.
+    function isFinance(address who) public view returns (bool) {
+        return uint8(_tier(who)) >= uint8(Role.FINANCE);
     }
 
     /// @notice The role tier of `who` as a uint8 (0=NONE,1=VIEWER,2=SUPPORT,
     ///         3=MANAGER,4=FINANCE). The owner reads as 4 (FINANCE) so a panel can
     ///         render it uniformly, even though ownership is a higher capability.
-    /// @dev The old isAdmin / isManager / isFinance views were removed for
-    ///      contract size (no app called them): they are `roleOf >= 1 / 3 / 4`.
     function roleOf(address who) external view returns (uint8) {
         return uint8(_tier(who));
     }
@@ -2664,9 +2695,11 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         return (usedToday, dailyLimit);
     }
 
-    // getMerchantCurrency was removed for contract size (no app called it):
-    // the currency is `getMerchantInfo(merchant).currency`, a bytes32 code
-    // ("INR", "BRL", …) that MerchantRegistryLib.fromCurrency reads as text.
+    /// @notice The merchant's offramp currency as a readable code ("INR",
+    ///         "BRL", …) — so the UI never has to decode a bytes32.
+    function getMerchantCurrency(address merchant) external view returns (string memory) {
+        return MerchantRegistryLib.fromCurrency(merchants[merchant].currency);
+    }
 
     // ─── Proxy helpers (mirror ExampleIntegrator exactly) ─────────────
 
