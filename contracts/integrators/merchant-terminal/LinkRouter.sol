@@ -96,11 +96,16 @@ contract LinkRouter is EIP712 {
     ///      mark-paid, nor moved to another order. The EIP-712 domain binds the
     ///      chain id and this contract's address, so it cannot be replayed on
     ///      another chain or against another deployment. No nonce is needed:
-    ///      both actions are terminal for an order, so a replay reverts
-    ///      downstream on state that has already moved.
+    ///      every action is one-shot for an order, so a replay reverts
+    ///      downstream on state that has already moved (the Diamond accepts one
+    ///      dispute per order).
     bytes32 private constant MARK_PAID_TYPEHASH =
         keccak256("MarkPaid(bytes32 linkId,uint256 orderId)");
     bytes32 private constant CANCEL_TYPEHASH = keccak256("Cancel(bytes32 linkId,uint256 orderId)");
+    /// @dev Also binds the last 4 digits, so the link wallet cannot file the
+    ///      customer's dispute with digits they did not give.
+    bytes32 private constant DISPUTE_TYPEHASH =
+        keccak256("Dispute(bytes32 linkId,uint256 orderId,uint256 redactTransId)");
 
     // ─── Events ───────────────────────────────────────────────────────
 
@@ -108,6 +113,7 @@ contract LinkRouter is EIP712 {
     event OrderPlaced(bytes32 indexed linkId, uint256 indexed orderId, address customer);
     event OrderMarkedPaid(bytes32 indexed linkId, uint256 indexed orderId);
     event OrderCancelled(bytes32 indexed linkId, uint256 indexed orderId);
+    event OrderDisputed(bytes32 indexed linkId, uint256 indexed orderId);
 
     // ─── Errors ───────────────────────────────────────────────────────
 
@@ -213,7 +219,12 @@ contract LinkRouter is EIP712 {
         uint256 orderId,
         bytes calldata signature
     ) external nonReentrant {
-        _authorise(linkId, orderId, MARK_PAID_TYPEHASH, signature);
+        _authorise(
+            linkId,
+            orderId,
+            keccak256(abi.encode(MARK_PAID_TYPEHASH, linkId, orderId)),
+            signature
+        );
         integrator.relayerMarkPaid(linkId, orderId);
         emit OrderMarkedPaid(linkId, orderId);
     }
@@ -231,9 +242,39 @@ contract LinkRouter is EIP712 {
         uint256 orderId,
         bytes calldata signature
     ) external nonReentrant {
-        _authorise(linkId, orderId, CANCEL_TYPEHASH, signature);
+        _authorise(
+            linkId,
+            orderId,
+            keccak256(abi.encode(CANCEL_TYPEHASH, linkId, orderId)),
+            signature
+        );
         integrator.relayerCancelOrder(linkId, orderId);
         emit OrderCancelled(linkId, orderId);
+    }
+
+    /**
+     * @notice Raise the Diamond's dispute on an order — the customer paid but
+     *         the order was cancelled.
+     * @param redactTransId The last 4 digits of the customer's bank transfer.
+     * @dev Customer-signed like the others: a dispute is the customer's claim,
+     *      so the link wallet alone cannot file one. The order's link comes from
+     *      this contract's own record, which cancellation does not clear. The
+     *      Diamond enforces when a dispute is allowed.
+     */
+    function dispute(
+        bytes32 linkId,
+        uint256 orderId,
+        uint256 redactTransId,
+        bytes calldata signature
+    ) external nonReentrant {
+        _authorise(
+            linkId,
+            orderId,
+            keccak256(abi.encode(DISPUTE_TYPEHASH, linkId, orderId, redactTransId)),
+            signature
+        );
+        integrator.relayerRaiseDispute(linkId, orderId, redactTransId);
+        emit OrderDisputed(linkId, orderId);
     }
 
     // ─── Views ────────────────────────────────────────────────────────
@@ -255,15 +296,27 @@ contract LinkRouter is EIP712 {
         return _hashTypedDataV4(keccak256(abi.encode(CANCEL_TYPEHASH, linkId, orderId)));
     }
 
+    /// @notice The EIP-712 digest a customer signs to dispute an order.
+    function disputeDigest(
+        bytes32 linkId,
+        uint256 orderId,
+        uint256 redactTransId
+    ) external view returns (bytes32) {
+        return
+            _hashTypedDataV4(
+                keccak256(abi.encode(DISPUTE_TYPEHASH, linkId, orderId, redactTransId))
+            );
+    }
+
     // ─── Internal ─────────────────────────────────────────────────────
 
-    /// @dev The three checks shared by mark-paid and cancel: the caller is this
-    ///      link's wallet, the order really belongs to this link, and the
-    ///      order's own customer signed this exact action.
+    /// @dev The three checks shared by every customer action: the caller is
+    ///      this link's wallet, the order really belongs to this link, and the
+    ///      order's own customer signed this exact action (`structHash`).
     function _authorise(
         bytes32 linkId,
         uint256 orderId,
-        bytes32 typeHash,
+        bytes32 structHash,
         bytes calldata signature
     ) private view {
         if (msg.sender != linkAgent[linkId]) revert NotLinkAgent();
@@ -272,7 +325,7 @@ contract LinkRouter is EIP712 {
         if (o.customer == address(0)) revert UnknownOrder();
         if (o.linkId != linkId) revert OrderLinkMismatch();
 
-        bytes32 digest = _hashTypedDataV4(keccak256(abi.encode(typeHash, linkId, orderId)));
+        bytes32 digest = _hashTypedDataV4(structHash);
         // ECDSA.recover reverts on a malformed or malleable (high-s) signature
         // rather than returning a junk address, so a bad signature can never be
         // mistaken for a valid one from an unexpected signer.

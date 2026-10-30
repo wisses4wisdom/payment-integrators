@@ -200,6 +200,10 @@ describe("LinkRouter — the fiat-withdrawal seam (round-4 N1)", function () {
     expect(fns).to.deep.equal([
       "cancel",
       "cancelDigest",
+      // The customer's dispute on a link order — also customer-signed, and
+      // also only reaching the Diamond through the merchant's proxy.
+      "dispute",
+      "disputeDigest",
       "eip712Domain",
       "integrator",
       "linkAgent",

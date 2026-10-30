@@ -646,24 +646,11 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         _;
     }
 
-    /// @notice True if `who` can perform ANY admin action (an owner or any role).
-    function isAdmin(address who) public view returns (bool) {
-        return isOwner[who] || adminRole[who] != Role.NONE;
-    }
-
-    /// @notice True if `who` can perform MANAGER (config) actions or higher.
-    function isManager(address who) public view returns (bool) {
-        return uint8(_tier(who)) >= uint8(Role.MANAGER);
-    }
-
-    /// @notice True if `who` can perform FINANCE (money-recovery) actions.
-    function isFinance(address who) public view returns (bool) {
-        return uint8(_tier(who)) >= uint8(Role.FINANCE);
-    }
-
     /// @notice The role tier of `who` as a uint8 (0=NONE,1=VIEWER,2=SUPPORT,
     ///         3=MANAGER,4=FINANCE). The owner reads as 4 (FINANCE) so a panel can
     ///         render it uniformly, even though ownership is a higher capability.
+    /// @dev The old isAdmin / isManager / isFinance views were removed for
+    ///      contract size (no app called them): they are `roleOf >= 1 / 3 / 4`.
     function roleOf(address who) external view returns (uint8) {
         return uint8(_tier(who));
     }
@@ -1381,7 +1368,13 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     function _relayForward(bytes32 linkId, uint256 orderId, bytes memory data) internal {
         if (msg.sender != trustedRelayer) revert OnlyTrustedRelayer();
         if (linkId == bytes32(0) || orderToLink[orderId] != linkId) revert LinkNotFound();
-        UserProxy(proxyAddress(links[linkId].owner)).execute(diamond, data, address(usdc), 0);
+        _viaProxy(links[linkId].owner, data);
+    }
+
+    /// @dev Calls the Diamond as `merchant`'s proxy — the `order.user` of every
+    ///      link order of theirs, and the only caller the Diamond accepts for it.
+    function _viaProxy(address merchant, bytes memory data) internal {
+        UserProxy(proxyAddress(merchant)).execute(diamond, data, address(usdc), 0);
     }
 
     /// @notice Cancel a link order, on the absent merchant's behalf.
@@ -1407,6 +1400,43 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         if (!linkOrdersEnabled) revert LinkOrdersDisabled();
         _relayForward(linkId, orderId, abi.encodeCall(IOrderFlow.cancelOrder, (orderId)));
         emit LinkOrderCancelled(linkId, orderId);
+    }
+
+    /// @notice Raise the Diamond's dispute on a link order, for its customer.
+    /// @dev The Router calls this only after checking the order's own customer
+    ///      signed this dispute (LinkRouter.dispute), so it is relayer-gated.
+    ///      The Diamond accepts a dispute only from `order.user`, which for a
+    ///      link order is the merchant's proxy: this is the one route to it.
+    ///
+    ///      Not `_relayForward`: a dispute is for a CANCELLED order, and
+    ///      cancellation deletes `orderToLink`. The order and link are matched
+    ///      by the Router's own record instead, and the Diamond itself refuses
+    ///      a dispute from any proxy but the order's, so another merchant's
+    ///      order cannot be reached through this link.
+    ///
+    ///      Like mark-paid, neither paused nor kill-switch gated: it protects a
+    ///      customer who paid. The Diamond enforces the rest (cancelled after
+    ///      being marked paid, 15 min to 24 h after placement).
+    ///
+    ///      No event of its own: the Diamond records and emits the dispute, and
+    ///      the Router emits `OrderDisputed` (this contract is at the size limit).
+    function relayerRaiseDispute(
+        bytes32 linkId,
+        uint256 orderId,
+        uint256 redactTransId
+    ) external nonReentrant {
+        if (msg.sender != trustedRelayer) revert OnlyTrustedRelayer();
+        address owner = links[linkId].owner;
+        if (owner == address(0)) revert LinkNotFound();
+        _viaProxy(owner, abi.encodeCall(IOrderFlow.raiseDispute, (orderId, redactTransId)));
+    }
+
+    /// @notice The merchant raises the Diamond's dispute on one of their own
+    ///         link orders (their proxy is its `order.user`; anyone else's order
+    ///         reverts on the Diamond). A frozen merchant cannot.
+    function raiseLinkDispute(uint256 orderId, uint256 redactTransId) external nonReentrant {
+        if (merchants[msg.sender].isFrozen) revert MerchantIsFrozen();
+        _viaProxy(msg.sender, abi.encodeCall(IOrderFlow.raiseDispute, (orderId, redactTransId)));
     }
 
     /// @notice Whether a link can be paid right now — the pay page's precheck.
@@ -2634,11 +2664,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         return (usedToday, dailyLimit);
     }
 
-    /// @notice The merchant's offramp currency as a readable code ("INR",
-    ///         "BRL", …) — so the UI never has to decode a bytes32.
-    function getMerchantCurrency(address merchant) external view returns (string memory) {
-        return MerchantRegistryLib.fromCurrency(merchants[merchant].currency);
-    }
+    // getMerchantCurrency was removed for contract size (no app called it):
+    // the currency is `getMerchantInfo(merchant).currency`, a bytes32 code
+    // ("INR", "BRL", …) that MerchantRegistryLib.fromCurrency reads as text.
 
     // ─── Proxy helpers (mirror ExampleIntegrator exactly) ─────────────
 

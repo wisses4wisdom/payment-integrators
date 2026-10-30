@@ -51,6 +51,10 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
   let mockUsdc: any;
   let mockDiamond: any;
   let integrator: any;
+  // getMerchantCurrency was removed for contract size; the code is the
+  // bytes32 `currency` field of getMerchantInfo.
+  const currencyOf = async (who: string) =>
+    ethers.decodeBytes32String((await integrator.getMerchantInfo(who)).currency);
   let erc721Client: any;
 
   const USDC = (n: number) => ethers.parseUnits(n.toString(), 6);
@@ -191,7 +195,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
 
   // ─── multi-country: currency naming + per-country registration ─────
 
-  it("2a. currency codes round-trip for any country (register → getMerchantCurrency)", async function () {
+  it("2a. currency codes round-trip for any country (register → getMerchantInfo.currency)", async function () {
     // The public toCurrency/fromCurrency wrappers were removed for size; the
     // codecs live in MerchantRegistryLib and registration uses them directly.
     const signers = await ethers.getSigners();
@@ -202,7 +206,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       expect((await integrator.getMerchantInfo(who.address))[2]).to.equal(
         ethers.encodeBytes32String(codes[i])
       );
-      expect(await integrator.getMerchantCurrency(who.address)).to.equal(codes[i]);
+      expect(await currencyOf(who.address)).to.equal(codes[i]);
     }
   });
 
@@ -222,19 +226,19 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     expect(shopName).to.equal("Café Rio");
     expect(currency).to.equal(ethers.encodeBytes32String("BRL"));
     expect(isReg).to.equal(true);
-    expect(await integrator.getMerchantCurrency(merchant1.address)).to.equal("BRL");
+    expect(await currencyOf(merchant1.address)).to.equal("BRL");
   });
 
   it("2d. an Argentina merchant registers with ARS + (encrypted) CBU/alias", async function () {
     await integrator
       .connect(merchant2)
       .registerMerchant(enc("miguel.mp"), "Café del Sur", "ARS", SECTOR);
-    expect(await integrator.getMerchantCurrency(merchant2.address)).to.equal("ARS");
+    expect(await currencyOf(merchant2.address)).to.equal("ARS");
   });
 
   it("2e. registerMerchantRaw accepts a pre-packed bytes32 currency", async function () {
     await integrator.connect(merchant1).registerMerchantRaw(UPI_1, "Shop One", INR, SECTOR);
-    expect(await integrator.getMerchantCurrency(merchant1.address)).to.equal("INR");
+    expect(await currencyOf(merchant1.address)).to.equal("INR");
   });
 
   it("2g. registration ACCEPTS an empty payout blob — the check moved to withdrawal", async function () {
@@ -392,7 +396,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     ).to.be.revertedWithCustomError(integrator, "InvalidCurrency");
     // The canonical form still works.
     await integrator.connect(merchant1).registerMerchantRaw(UPI_1, "Shop", INR, SECTOR);
-    expect(await integrator.getMerchantCurrency(merchant1.address)).to.equal("INR");
+    expect(await currencyOf(merchant1.address)).to.equal("INR");
   });
 
   // ─── 3 + 4 + 5: validateOrder limits ──────────────────────────────
@@ -1179,13 +1183,13 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await expect(
         integrator.connect(merchant2).freezeMerchant(merchant1.address)
       ).to.be.revertedWithCustomError(integrator, "NotAuthorized");
-      expect(await integrator.isAdmin(merchant2.address)).to.equal(false);
+      expect((await integrator.roleOf(merchant2.address)) >= 1n).to.equal(false);
 
       // Owner adds merchant2 as an admin.
       await expect(integrator.connect(owner).setRole(merchant2.address, 4))
         .to.emit(integrator, "AdminAdded")
         .withArgs(merchant2.address);
-      expect(await integrator.isAdmin(merchant2.address)).to.equal(true);
+      expect((await integrator.roleOf(merchant2.address)) >= 1n).to.equal(true);
 
       // Now merchant2 (admin) CAN freeze/unfreeze.
       await expect(integrator.connect(merchant2).freezeMerchant(merchant1.address)).to.emit(
@@ -1204,7 +1208,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
 
       // Owner removes the admin → can no longer freeze.
       await integrator.connect(owner).setRole(merchant2.address, 0);
-      expect(await integrator.isAdmin(merchant2.address)).to.equal(false);
+      expect((await integrator.roleOf(merchant2.address)) >= 1n).to.equal(false);
       await expect(
         integrator.connect(merchant2).freezeMerchant(merchant1.address)
       ).to.be.revertedWithCustomError(integrator, "NotAuthorized");
@@ -1219,9 +1223,9 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await expect(integrator.connect(owner).setRole(admin.address, 1))
         .to.emit(integrator, "AdminRoleSet")
         .withArgs(admin.address, 1);
-      expect(await integrator.isAdmin(admin.address)).to.equal(true);
-      expect(await integrator.isManager(admin.address)).to.equal(false);
-      expect(await integrator.isFinance(admin.address)).to.equal(false);
+      expect((await integrator.roleOf(admin.address)) >= 1n).to.equal(true);
+      expect((await integrator.roleOf(admin.address)) >= 3n).to.equal(false);
+      expect((await integrator.roleOf(admin.address)) >= 4n).to.equal(false);
       expect(await integrator.roleOf(admin.address)).to.equal(1);
       // VIEWER cannot even freeze (needs SUPPORT).
       await expect(
@@ -1249,7 +1253,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
 
       // ── MANAGER (3): + caps/limit/relayer AND still freeze (hierarchical). ──
       await integrator.connect(owner).setRole(admin.address, 3);
-      expect(await integrator.isManager(admin.address)).to.equal(true);
+      expect((await integrator.roleOf(admin.address)) >= 3n).to.equal(true);
       expect(await integrator.roleOf(admin.address)).to.equal(3);
       await expect(integrator.connect(admin).setPerTxCap(MXN, USDC(75))).to.emit(
         integrator,
@@ -1271,7 +1275,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       // ── FINANCE (4): + money recovery. (abort reverts on unknown id, but with
       //    a DIFFERENT error than NotAuthorized — proving the gate now passes.) ──
       await integrator.connect(owner).setRole(admin.address, 4);
-      expect(await integrator.isFinance(admin.address)).to.equal(true);
+      expect((await integrator.roleOf(admin.address)) >= 4n).to.equal(true);
       expect(await integrator.roleOf(admin.address)).to.equal(4);
       await expect(
         integrator.connect(admin).adminAbortWithdrawal(999999)
@@ -1287,7 +1291,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
 
       // ── Revoke (0). ──
       await integrator.connect(owner).setRole(admin.address, 0);
-      expect(await integrator.isAdmin(admin.address)).to.equal(false);
+      expect((await integrator.roleOf(admin.address)) >= 1n).to.equal(false);
       expect(await integrator.roleOf(admin.address)).to.equal(0);
       await expect(
         integrator.connect(admin).freezeMerchant(merchant1.address)
@@ -1295,8 +1299,8 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
 
       // Owner reads as FINANCE (4, top tier) and satisfies every check.
       expect(await integrator.roleOf(owner.address)).to.equal(4);
-      expect(await integrator.isManager(owner.address)).to.equal(true);
-      expect(await integrator.isFinance(owner.address)).to.equal(true);
+      expect((await integrator.roleOf(owner.address)) >= 3n).to.equal(true);
+      expect((await integrator.roleOf(owner.address)) >= 4n).to.equal(true);
 
       // setRole(FINANCE) is the full admin tier (the addAdmin/removeAdmin
       // shims were removed for size).
@@ -2971,7 +2975,6 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
         "getMerchantInfo(address)",
         "getMerchantBuckets(address)",
         "getDailyTxInfo(address)",
-        "getMerchantCurrency(address)",
         "proxyAddress(address)",
         "registered(address)",
         // governance + recovery surface (admin panel / ops)
@@ -3019,7 +3022,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       ).to.throw();
       // The 4-arg form works + locks the currency.
       await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", "INR", SECTOR);
-      expect(await integrator.getMerchantCurrency(merchant1.address)).to.equal("INR");
+      expect(await currencyOf(merchant1.address)).to.equal("INR");
     });
 
     it("the business sector is required and round-trips", async function () {
