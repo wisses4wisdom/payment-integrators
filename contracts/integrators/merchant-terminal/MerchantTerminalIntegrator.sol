@@ -13,6 +13,7 @@ import { MerchantRegistryLib } from "./MerchantRegistryLib.sol";
 import { MerchantTypes } from "./MerchantTypes.sol";
 import { SettlementLib } from "./SettlementLib.sol";
 import { MerchantImportLib } from "./MerchantImportLib.sol";
+import { LinkDisputeLib } from "./LinkDisputeLib.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
@@ -595,10 +596,14 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     bool transient _cbLocked;
 
     modifier nonReentrantCallback() {
-        if (_cbLocked) revert Reentrancy();
-        _cbLocked = true;
+        _enterCallback();
         _;
         _cbLocked = false;
+    }
+
+    function _enterCallback() private {
+        if (_cbLocked) revert Reentrancy();
+        _cbLocked = true;
     }
 
     // ─── Break-glass pause ────────────────────────────────────────────
@@ -624,13 +629,21 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     // ─── Access modifiers ─────────────────────────────────────────────
 
     modifier onlyDiamond() {
-        if (msg.sender != diamond) revert OnlyDiamond();
+        _onlyDiamond();
         _;
     }
 
+    function _onlyDiamond() private view {
+        if (msg.sender != diamond) revert OnlyDiamond();
+    }
+
     modifier onlyOwner() {
-        if (!isOwner[msg.sender]) revert OnlyOwner();
+        _onlyOwner();
         _;
+    }
+
+    function _onlyOwner() private view {
+        if (!isOwner[msg.sender]) revert OnlyOwner();
     }
 
     /// @dev Restricts an action to the single super-admin. Used for the root of
@@ -1405,7 +1418,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     /// @dev Calls the Diamond as `merchant`'s proxy — the `order.user` of every
     ///      link order of theirs, and the only caller the Diamond accepts for it.
     function _viaProxy(address merchant, bytes memory data) internal {
-        UserProxy(proxyAddress(merchant)).execute(diamond, data, address(usdc), 0);
+        LinkDisputeLib.callDiamond(proxyAddress(merchant), diamond, address(usdc), data);
     }
 
     /// @notice Cancel a link order, on the absent merchant's behalf.
@@ -1459,7 +1472,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         if (msg.sender != trustedRelayer) revert OnlyTrustedRelayer();
         address owner = links[linkId].owner;
         if (owner == address(0)) revert LinkNotFound();
-        _viaProxy(owner, abi.encodeCall(IOrderFlow.raiseDispute, (orderId, redactTransId)));
+        _raiseDispute(owner, orderId, redactTransId);
     }
 
     /// @notice The merchant raises the Diamond's dispute on one of their own
@@ -1467,7 +1480,18 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         reverts on the Diamond). A frozen merchant cannot.
     function raiseLinkDispute(uint256 orderId, uint256 redactTransId) external nonReentrant {
         if (merchants[msg.sender].isFrozen) revert MerchantIsFrozen();
-        _viaProxy(msg.sender, abi.encodeCall(IOrderFlow.raiseDispute, (orderId, redactTransId)));
+        _raiseDispute(msg.sender, orderId, redactTransId);
+    }
+
+    /// @dev Both dispute entry points: `merchant`'s proxy raises it (LinkDisputeLib).
+    function _raiseDispute(address merchant, uint256 orderId, uint256 redactTransId) private {
+        LinkDisputeLib.raise(
+            proxyAddress(merchant),
+            diamond,
+            address(usdc),
+            orderId,
+            redactTransId
+        );
     }
 
     /// @notice Whether a link can be paid right now — the pay page's precheck.
